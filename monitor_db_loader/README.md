@@ -1,0 +1,137 @@
+# Monitor DB Loader
+
+QGIS-плагин для подключения к PostgreSQL (БД Monitor) и загрузки пространственных слоёв с символикой из JSON-конфигурации.
+
+## Целевая версия
+
+**QGIS 3.44 LTR** (рабочая среда, Qt5 / PyQt5).
+
+Плагин также устанавливается на **QGIS 4.x** (Qt6) — enum Qt вынесены в `core/qt_compat.py`.
+
+| Версия QGIS | Каталог профиля (плагины) |
+|-------------|---------------------------|
+| 3.44 LTR | `QGIS3/profiles/default/python/plugins/` |
+| 4.x | `QGIS4/profiles/default/python/plugins/` |
+
+### Пути к каталогу плагинов
+
+**Windows (рабочий ПК):**
+
+```text
+%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\
+```
+
+**Linux:**
+
+```text
+~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/
+```
+
+**macOS:**
+
+```text
+~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/
+```
+
+## Требования
+
+- QGIS **3.44** или новее (до 4.x включительно)
+- Доступ к PostgreSQL/PostGIS (параметры в `resources/layers_config.json`)
+- Рекомендуется **psycopg2** в Python QGIS (автоопределение геометрического столбца)
+
+Проверка psycopg2 в консоли Python QGIS:
+
+```python
+import psycopg2
+```
+
+Если модуля нет — установите через OSGeo4W / pip в окружение QGIS (на Windows часто: `python -m pip install psycopg2-binary` из OSGeo4W Shell).
+
+## Установка
+
+### Вариант A: из ZIP (рекомендуется)
+
+1. Соберите архив из корня репозитория:
+
+   ```bash
+   ./scripts/build_plugin_zip.sh
+   ```
+
+   Файл: `dist/monitor_db_loader.zip`
+
+2. В QGIS 3.44: **Модули → Управление модулями → Установить модуль из ZIP…**
+3. Выберите ZIP, включите **Monitor DB Loader** на вкладке «Установленные».
+
+### Вариант B: копирование каталога
+
+Скопируйте папку `monitor_db_loader` в каталог плагинов (см. таблицу выше) и перезапустите QGIS.
+
+## Использование
+
+- При `load_on_startup: true` в конфиге — диалог пароля после запуска QGIS.
+- Меню **Monitor DB Loader** / панель — **Загрузить слои Monitor DB**.
+- Пароль не сохраняется.
+- Ошибка подключения — сообщение и **Повторить**.
+- Ошибка слоя — пропуск, запись в журнал **Monitor DB Loader**.
+
+## Конфигурация
+
+`resources/layers_config.json` — подключение, группы слоёв, символика.
+
+У каждого слоя в JSON указаны **`schema`** и **`geometry_column`**. Актуальная структура БД:
+
+| Схема | Слои | Geom-столбец |
+|-------|------|----------------|
+| `data_mos` | `items_*` | `geom` |
+| `vector_stroy` | `url_222` | `geom` |
+| `stroymonitoring` | `boundaries_aip` | `geom_valid` |
+| `lens` | `reports`, `contours*` | `geom` / `geometry` |
+| `genplan` | `responses` | `photo_geom`, `geom` |
+| `odh_export` | `hood`, `dgi` | `geom` |
+
+## Ручная проверка (QGIS 3.44)
+
+1. Установить из ZIP, включить плагин.
+2. Диалог пароля при старте; неверный пароль → «Повторить».
+3. В дереве слоёв: 7 групп + 2 слоя в корне.
+4. Символика камер, rule-based «Собственность» (скрыт), контур «Границы районов».
+5. Частичная загрузка при недоступной БД — счётчик «N из M» и лог.
+
+## Безопасность
+
+Пароль не пишется в JSON, `QSettings` и логи. Параметры хоста/пользователя — в JSON внутри плагина.
+
+## Где смотреть логи, если слои не загрузились
+
+### 1. Журнал сообщений QGIS (главное)
+
+**Вид → Панели → Журнал сообщений** (англ. *View → Panels → Log Messages*).
+
+На вкладке **Monitor DB Loader** — все сообщения плагина: подключение, каждая таблица, ошибки geom и PostGIS.
+
+На вкладке **PostGIS** / **General** — ошибки драйвера PostgreSQL (сеть, SSL, права).
+
+Включите уровни **Info** и **Warning** (иконки фильтра в панели), иначе часть записей может быть скрыта.
+
+### 2. Файл лога на диске
+
+| ОС | Путь (профиль по умолчанию) |
+|----|----------------------------|
+| Windows | `%APPDATA%\QGIS\QGIS3\profiles\default\qgis\qgis.log` |
+| macOS | `~/Library/Application Support/QGIS/QGIS3/profiles/default/qgis/qgis.log` |
+| Linux | `~/.local/share/QGIS/QGIS3/profiles/default/qgis/qgis.log` |
+
+Ищите строки с `Monitor DB Loader` или ошибки `postgres` / `PostGIS`.
+
+### 3. Консоль Python (для разовой отладки)
+
+**Модули → Консоль Python** — при ручном запуске плагина смотрите traceback, если окно «зависло» без сообщения.
+
+### Типичные причины «долго думал, 0 слоёв»
+
+- Нет доступа к хосту `77.222.63.161:5432` с рабочего ПК (VPN, файрвол).
+- Неверная схема/таблица или столбец геометрии не `geom` — в логе: «Не найден геометрический столбец».
+- Без psycopg2 перебор 18×4 подключений к БД занимает много времени.
+- Проверка подключения прошла, но таблицы в другой схеме, не `public`.
+
+После обновления плагина (v1.0.2+) журнал **Monitor DB Loader** показывает пошаговую загрузку каждого слоя.
