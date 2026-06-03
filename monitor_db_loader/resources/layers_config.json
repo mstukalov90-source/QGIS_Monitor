@@ -232,7 +232,7 @@
             "center_color": "#000000",
             "outer_color": "#FF0000",
             "outer_width": 2,
-            "size": 5,
+            "size": 6,
             "marker_type": "circle_with_border"
           },
           "schema": "lens",
@@ -323,17 +323,21 @@
       },
       "schema": "odh_export",
       "geometry_column": "geom"
-    },
+    }
+  ],
+  "ungrouped_groups": [
     {
-      "table_name": "dgi",
-      "display_name": "Собственность",
-      "geometry_type": "polygon",
+      "group_name": "Собственность",
       "default_visibility": false,
-      "rule_based_symbology": true,
-      "rules": [
+      "layers": [
         {
-          "name": "Город Москва и неизвестные",
-          "condition": "short_sobstv_rr IN ('город Москва', 'Нет данных о правообладателе')",
+          "table_name": "dgi",
+          "display_name": "город Москва",
+          "geometry_type": "polygon",
+          "schema": "odh_export",
+          "geometry_column": "geom",
+          "primary_key": "id",
+          "sql_filter": "short_sobstv_rr = 'город Москва'",
           "symbology": {
             "fill_color": "#FF0000",
             "fill_opacity": 0.5,
@@ -348,8 +352,34 @@
           }
         },
         {
-          "name": "Прочие",
-          "condition": "ELSE",
+          "table_name": "dgi",
+          "display_name": "Нет данных о правообладателе",
+          "geometry_type": "polygon",
+          "schema": "odh_export",
+          "geometry_column": "geom",
+          "primary_key": "id",
+          "sql_filter": "short_sobstv_rr = 'Нет данных о правообладателе'",
+          "symbology": {
+            "fill_color": "#FF0000",
+            "fill_opacity": 0.5,
+            "outline_color": "#FF0000",
+            "outline_width": 1.0,
+            "hatch": {
+              "enabled": true,
+              "color": "#FFFFFF",
+              "angle": 45,
+              "spacing": 5
+            }
+          }
+        },
+        {
+          "table_name": "dgi",
+          "display_name": "Частная собственность",
+          "geometry_type": "polygon",
+          "schema": "odh_export",
+          "geometry_column": "geom",
+          "primary_key": "id",
+          "sql_filter": "short_sobstv_rr IS NULL OR short_sobstv_rr NOT IN ('город Москва', 'Нет данных о правообладателе')",
           "symbology": {
             "fill_color": "#FFA500",
             "fill_opacity": 0.5,
@@ -363,9 +393,7 @@
             }
           }
         }
-      ],
-      "schema": "odh_export",
-      "geometry_column": "geom"
+      ]
     }
   ],
   "additional_functionality": {

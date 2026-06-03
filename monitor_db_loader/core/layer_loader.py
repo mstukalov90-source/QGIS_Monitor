@@ -9,9 +9,9 @@ from qgis.PyQt.QtWidgets import QMessageBox
 
 from .config import (
     LOG_CHANNEL,
-    is_mixed_geometry,
     iter_all_layer_defs,
     layer_groups,
+    ungrouped_layer_groups,
     ungrouped_layers,
 )
 from .db import DatabaseConnection
@@ -62,6 +62,15 @@ class LayerLoader:
 
         for layer_def in ungrouped_layers(self.config):
             self._load_single(layer_def, None, result)
+
+        for group_def in ungrouped_layer_groups(self.config):
+            group_name = group_def.get("group_name", "")
+            group_node = self.root.addGroup(group_name)
+            result.group_names.append(group_name)
+            if group_def.get("default_visibility") is False:
+                group_node.setItemVisibilityChecked(False)
+            for layer_def in group_def.get("layers", []):
+                self._load_single(layer_def, group_node, result)
 
         log_info(
             f"Загрузка завершена: успешно {result.loaded}, ошибок {result.failed} "

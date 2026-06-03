@@ -4,20 +4,24 @@
 from typing import Any, Dict, List, Optional
 
 from qgis.core import (
+    QgsCategorizedSymbolRenderer,
     QgsFillSymbol,
     QgsLinePatternFillSymbolLayer,
     QgsLineSymbol,
     QgsMarkerSymbol,
+    QgsRendererCategory,
     QgsRuleBasedRenderer,
     QgsSimpleFillSymbolLayer,
     QgsSimpleLineSymbolLayer,
     QgsSimpleMarkerSymbolLayer,
     QgsSingleSymbolRenderer,
+    QgsUnitTypes,
     QgsVectorLayer,
 )
 from qgis.PyQt.QtGui import QColor
 
 from .config import is_mixed_geometry, normalize_geometry_type
+from .log_util import log_info, log_warning
 from .qt_compat import PEN_DASH, PEN_NONE, PEN_SOLID
 
 
@@ -29,6 +33,10 @@ def _color(hex_color: str, alpha: Optional[float] = None) -> QColor:
 
 
 def apply_symbology(layer: QgsVectorLayer, layer_def: Dict[str, Any]) -> None:
+    if layer_def.get("categorized_symbology") or layer_def.get("categorized_field"):
+        _apply_categorized(layer, layer_def)
+        return
+
     if layer_def.get("rule_based_symbology"):
         _apply_rule_based(layer, layer_def)
         return
@@ -37,9 +45,8 @@ def apply_symbology(layer: QgsVectorLayer, layer_def: Dict[str, Any]) -> None:
     geometry_type = layer_def.get("geometry_type")
 
     if symbology.get("complex_marker"):
-        layer.setRenderer(
-            QgsRuleBasedRenderer(_marker_with_border_rule(symbology))
-        )
+        symbol = _create_complex_point_symbol(symbology)
+        layer.setRenderer(QgsSingleSymbolRenderer(symbol))
         layer.triggerRepaint()
         return
 
@@ -62,13 +69,69 @@ def apply_symbology(layer: QgsVectorLayer, layer_def: Dict[str, Any]) -> None:
         layer.triggerRepaint()
 
 
+def _symbology_from_rules(rules: List[Dict], role: str) -> Dict[str, Any]:
+    """role: 'red' (first non-ELSE) or 'default' (ELSE)."""
+    for rule in rules:
+        if rule.get("condition", "").upper() == "ELSE":
+            if role == "default":
+                return rule.get("symbology", {})
+        else:
+            if role == "red":
+                return rule.get("symbology", {})
+    return {}
+
+
+def _apply_categorized(layer: QgsVectorLayer, layer_def: Dict[str, Any]) -> None:
+    field = layer_def.get("categorized_field", "short_sobstv_rr")
+    idx = layer.fields().indexOf(field)
+    if idx < 0:
+        log_warning(
+            f"Символика «{layer.name()}»: поле «{field}» не найдено, "
+            f"доступны: {[f.name() for f in layer.fields()]}"
+        )
+        return
+
+    rules = layer_def.get("rules", [])
+    red_values = layer_def.get("red_category_values", ())
+    red_label = "Город Москва и неизвестные"
+    default_label = "Прочие"
+    for rule in rules:
+        if rule.get("condition", "").upper() == "ELSE":
+            default_label = rule.get("name", default_label)
+        else:
+            red_label = rule.get("name", red_label)
+
+    red_sym = _create_polygon_symbol(_symbology_from_rules(rules, "red"))
+    default_sym = _create_polygon_symbol(_symbology_from_rules(rules, "default"))
+
+    categories = []
+    for val in red_values:
+        if red_sym is None:
+            continue
+        categories.append(
+            QgsRendererCategory(str(val), red_sym.clone(), red_label)
+        )
+
+    renderer = QgsCategorizedSymbolRenderer(field, categories)
+    if default_sym:
+        renderer.setSourceSymbol(default_sym.clone())
+        if hasattr(renderer, "setSourceSymbolAnnotation"):
+            renderer.setSourceSymbolAnnotation(default_label)
+
+    layer.setRenderer(renderer)
+    layer.triggerRepaint()
+    log_info(
+        f"Символика «{layer.name()}»: categorized по «{field}», "
+        f"{len(categories)} значений → «{red_label}», остальное → «{default_label}»"
+    )
+
+
 def _apply_mixed_geometry(
     layer: QgsVectorLayer,
     geometry_type: Any,
     symbology: Dict[str, Any],
 ) -> None:
     root = QgsRuleBasedRenderer.Rule(None)
-    # OGR/PostGIS отдают MultiPoint, MultiLineString и т.д. — не только Point/Line
     mapping = {
         "point": (
             "Точки",
@@ -98,8 +161,7 @@ def _apply_mixed_geometry(
                 rule.setDescription(label)
             root.appendChild(rule)
 
-    renderer = QgsRuleBasedRenderer(root)
-    layer.setRenderer(renderer)
+    layer.setRenderer(QgsRuleBasedRenderer(root))
     layer.triggerRepaint()
 
 
@@ -111,7 +173,6 @@ def _apply_rule_based(layer: QgsVectorLayer, layer_def: Dict[str, Any]) -> None:
         if condition.upper() == "ELSE":
             rule = QgsRuleBasedRenderer.Rule(symbol)
             rule.setIsElse(True)
-            rule.setLabel(rule_def.get("name", ""))
         else:
             rule = QgsRuleBasedRenderer.Rule(
                 symbol,
@@ -125,25 +186,21 @@ def _apply_rule_based(layer: QgsVectorLayer, layer_def: Dict[str, Any]) -> None:
     layer.triggerRepaint()
 
 
-def _marker_with_border_rule(symbology: Dict[str, Any]) -> QgsRuleBasedRenderer.Rule:
-    size = float(symbology.get("size", 5))
+def _create_complex_point_symbol(symbology: Dict[str, Any]) -> QgsMarkerSymbol:
+    """Круг с чёрным центром и красной обводкой (один слой маркера)."""
+    size = float(symbology.get("size", 6))
     outer_w = float(symbology.get("outer_width", 2))
-    outer = QgsMarkerSymbol()
-    outer_layer = QgsSimpleMarkerSymbolLayer()
-    outer_layer.setShape(QgsSimpleMarkerSymbolLayer.Circle)
-    outer_layer.setSize(size + outer_w)
-    outer_layer.setColor(_color(symbology.get("outer_color", "#FF0000")))
-    outer_layer.setStrokeStyle(PEN_NONE)
-    outer.appendSymbolLayer(outer_layer)
-
-    inner = QgsSimpleMarkerSymbolLayer()
-    inner.setShape(QgsSimpleMarkerSymbolLayer.Circle)
-    inner.setSize(size)
-    inner.setColor(_color(symbology.get("center_color", "#000000")))
-    inner.setStrokeStyle(PEN_NONE)
-    outer.appendSymbolLayer(inner)
-
-    return QgsRuleBasedRenderer.Rule(outer)
+    symbol = QgsMarkerSymbol()
+    layer = QgsSimpleMarkerSymbolLayer()
+    layer.setShape(QgsSimpleMarkerSymbolLayer.Circle)
+    layer.setSize(size)
+    layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+    layer.setColor(_color(symbology.get("center_color", "#000000")))
+    layer.setStrokeColor(_color(symbology.get("outer_color", "#FF0000")))
+    layer.setStrokeWidth(outer_w)
+    layer.setStrokeStyle(PEN_SOLID)
+    symbol.appendSymbolLayer(layer)
+    return symbol
 
 
 def _create_point_symbol(symbology: Dict[str, Any]) -> QgsMarkerSymbol:
@@ -155,6 +212,7 @@ def _create_point_symbol(symbology: Dict[str, Any]) -> QgsMarkerSymbol:
     else:
         layer.setShape(QgsSimpleMarkerSymbolLayer.Circle)
     layer.setSize(float(symbology.get("size", 3)))
+    layer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
     color = _color(symbology.get("color", "#000000"))
     opacity = symbology.get("opacity")
     if opacity is not None:

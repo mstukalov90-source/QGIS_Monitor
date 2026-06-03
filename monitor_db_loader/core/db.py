@@ -235,8 +235,11 @@ class DatabaseConnection:
                 layer_def, display_name, schema, table, geom_col, pk
             )
 
-        uri_str = self._build_uri_simple(schema, table, geom_col, pk)
+        sql_filter = layer_def.get("sql_filter", "")
+        uri_str = self._build_uri_simple(schema, table, geom_col, pk, sql_filter)
         log_info(f"  uri: {sanitize_uri(uri_str)}")
+        if sql_filter:
+            log_info(f"  filter: {sql_filter}")
         layer = QgsVectorLayer(uri_str, display_name, "postgres")
         if layer.isValid():
             finalize_vector_layer(layer)

@@ -29,6 +29,10 @@ def ungrouped_layers(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     return config.get("ungrouped_layers", [])
 
 
+def ungrouped_layer_groups(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return config.get("ungrouped_groups", [])
+
+
 def additional_functionality(config: Dict[str, Any]) -> Dict[str, Any]:
     return config.get("additional_functionality", {})
 
@@ -98,6 +102,10 @@ def iter_all_layer_defs(config: Dict[str, Any]):
             yield name, layer_def
     for layer_def in ungrouped_layers(config):
         yield None, layer_def
+    for group in ungrouped_layer_groups(config):
+        name = group.get("group_name", "")
+        for layer_def in group.get("layers", []):
+            yield name, layer_def
 
 
 def count_layers(config: Dict[str, Any]) -> int:
