@@ -94,18 +94,31 @@ def geom_column_candidates() -> tuple:
     return _GEOM_CANDIDATES
 
 
+def _iter_group_layers(
+    group_def: Dict[str, Any],
+    path: Optional[str] = None,
+):
+    """Yield (group_path, layer_def) for layers in group_def and nested groups."""
+    name = group_def.get("group_name", "")
+    current_path = f"{path}/{name}" if path else name
+
+    for layer_def in group_def.get("layers", []):
+        yield current_path or None, layer_def
+
+    for child in group_def.get("groups", []):
+        yield from _iter_group_layers(child, current_path)
+
+
 def iter_all_layer_defs(config: Dict[str, Any]):
-    """Yield (group_name or None, layer_def) for every configured layer."""
+    """Yield (group_path or None, layer_def) for every configured layer."""
     for group in layer_groups(config):
-        name = group.get("group_name", "")
-        for layer_def in group.get("layers", []):
-            yield name, layer_def
+        yield from _iter_group_layers(group)
+
     for layer_def in ungrouped_layers(config):
         yield None, layer_def
+
     for group in ungrouped_layer_groups(config):
-        name = group.get("group_name", "")
-        for layer_def in group.get("layers", []):
-            yield name, layer_def
+        yield from _iter_group_layers(group)
 
 
 def count_layers(config: Dict[str, Any]) -> int:

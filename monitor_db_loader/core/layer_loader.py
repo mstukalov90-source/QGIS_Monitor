@@ -53,24 +53,13 @@ class LayerLoader:
         log_info(f"Начало загрузки слоёв (всего в конфиге: {result.total})…")
 
         for group_def in layer_groups(self.config):
-            group_name = group_def.get("group_name", "")
-            group_node = self.root.addGroup(group_name)
-            result.group_names.append(group_name)
-
-            for layer_def in group_def.get("layers", []):
-                self._load_single(layer_def, group_node, result)
+            self._load_group(group_def, None, result, top_level=True)
 
         for layer_def in ungrouped_layers(self.config):
             self._load_single(layer_def, None, result)
 
         for group_def in ungrouped_layer_groups(self.config):
-            group_name = group_def.get("group_name", "")
-            group_node = self.root.addGroup(group_name)
-            result.group_names.append(group_name)
-            if group_def.get("default_visibility") is False:
-                group_node.setItemVisibilityChecked(False)
-            for layer_def in group_def.get("layers", []):
-                self._load_single(layer_def, group_node, result)
+            self._load_group(group_def, None, result, top_level=True)
 
         log_info(
             f"Загрузка завершена: успешно {result.loaded}, ошибок {result.failed} "
@@ -79,6 +68,30 @@ class LayerLoader:
         for err in result.errors:
             log_warning(err)
         return result
+
+    def _load_group(
+        self,
+        group_def: Dict[str, Any],
+        parent_node,
+        result: LoadResult,
+        top_level: bool = False,
+    ):
+        group_name = group_def.get("group_name", "")
+        if parent_node is None:
+            group_node = self.root.addGroup(group_name)
+            if top_level:
+                result.group_names.append(group_name)
+        else:
+            group_node = parent_node.addGroup(group_name)
+
+        if group_def.get("default_visibility") is False:
+            group_node.setItemVisibilityChecked(False)
+
+        for layer_def in group_def.get("layers", []):
+            self._load_single(layer_def, group_node, result)
+
+        for child in group_def.get("groups", []):
+            self._load_group(child, group_node, result)
 
     def _load_single(self, layer_def: Dict[str, Any], group_node, result: LoadResult):
         display_name = layer_def.get("display_name", layer_def.get("table_name", ""))

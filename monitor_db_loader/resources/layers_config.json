@@ -1,7 +1,7 @@
 {
   "project": "QGIS Plugin Development",
   "task": "Database connection and layer visualization plugin",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Plugin for connecting to PostgreSQL database and displaying spatial layers with predefined symbology",
   "database_connection": {
     "host": "77.222.63.161",
@@ -12,6 +12,100 @@
     "connection_name": "Monitor DB Connection"
   },
   "layer_groups": [
+    {
+      "group_name": "Фото данные",
+      "groups": [
+        {
+          "group_name": "Данные от ГенПлан",
+          "layers": [
+            {
+              "table_name": "responses",
+              "display_name": "Фотографии после обработки ИИ",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#FF0000",
+                "size": 4,
+                "marker_type": "circle"
+              },
+              "schema": "genplan",
+              "geometry_column": "photo_geom"
+            },
+            {
+              "table_name": "responses",
+              "display_name": "Полигоны заказов по фотографиям",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#800000",
+                "outline_color": "#800000",
+                "fill_opacity": 0.75,
+                "outline_width": 1.0
+              },
+              "schema": "genplan",
+              "geometry_column": "geom"
+            }
+          ]
+        },
+        {
+          "group_name": "Данные Объектив",
+          "layers": [
+            {
+              "table_name": "reports",
+              "display_name": "Фото разрытий и строек",
+              "geometry_type": "point",
+              "symbology": {
+                "complex_marker": true,
+                "center_color": "#000000",
+                "outer_color": "#FF0000",
+                "outer_width": 2,
+                "size": 6,
+                "marker_type": "circle_with_border"
+              },
+              "schema": "lens",
+              "geometry_column": "geom"
+            },
+            {
+              "table_name": "contours",
+              "display_name": "Контура всех строек",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#FF0000",
+                "outline_color": "#FF0000",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "lens",
+              "geometry_column": "geometry"
+            },
+            {
+              "table_name": "contours_wip",
+              "display_name": "Контура в работе",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#FFFF00",
+                "outline_color": "#FFFF00",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "lens",
+              "geometry_column": "geometry"
+            },
+            {
+              "table_name": "contours_done",
+              "display_name": "Контура выполненые",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#008000",
+                "outline_color": "#008000",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "lens",
+              "geometry_column": "geometry"
+            }
+          ]
+        }
+      ]
+    },
     {
       "group_name": "Камеры ЕЦХД",
       "layers": [
@@ -57,277 +151,240 @@
       ]
     },
     {
-      "group_name": "Ордера ОАТИ",
-      "layers": [
+      "group_name": "Информационные данные",
+      "groups": [
         {
-          "table_name": "items_2855",
-          "display_name": "Ордера ОАТИ",
-          "geometry_type": [
-            "point",
-            "line",
-            "polygon"
-          ],
-          "symbology": {
-            "point": {
-              "color": "#006400",
-              "size": 3
+          "group_name": "Ордера ОАТИ",
+          "layers": [
+            {
+              "table_name": "items_2855_points",
+              "display_name": "Ордера ОАТИ — точки",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#006400",
+                "size": 3
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
             },
-            "line": {
-              "color": "#006400",
-              "width": 1.0
+            {
+              "table_name": "items_2855_lines",
+              "display_name": "Ордера ОАТИ — линии",
+              "geometry_type": "line",
+              "symbology": {
+                "color": "#006400",
+                "width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
             },
-            "polygon": {
-              "fill_color": "#006400",
-              "outline_color": "#006400",
-              "fill_opacity": 0.5,
-              "outline_width": 1.0
+            {
+              "table_name": "items_2855_polygons",
+              "display_name": "Ордера ОАТИ — полигоны",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#006400",
+                "outline_color": "#006400",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
             }
-          },
-          "schema": "data_mos",
-          "geometry_column": "geom",
-          "primary_key": "id",
-          "mixed_geometry": true
+          ]
+        },
+        {
+          "group_name": "Объекты капитального строительства",
+          "layers": [
+            {
+              "table_name": "items_2941",
+              "display_name": "Точки капитального строительства",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#000000",
+                "size": 4,
+                "marker_type": "square"
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom"
+            },
+            {
+              "table_name": "url_222",
+              "display_name": "Полигоны капитального строительства",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#808080",
+                "outline_color": "#808080",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "vector_stroy",
+              "geometry_column": "geom"
+            },
+            {
+              "table_name": "boundaries_aip",
+              "display_name": "Полигоны СтройМониторинг",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#404040",
+                "outline_color": "#404040",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "stroymonitoring",
+              "geometry_column": "geom_valid"
+            }
+          ]
+        },
+        {
+          "group_name": "Данные о действующих зарегистрированных уведомлениях на проведение земляных работ",
+          "layers": [
+            {
+              "table_name": "items_62501_points",
+              "display_name": "Уведомления на земляные работы — точки",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#8B4513",
+                "size": 3
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62501_lines",
+              "display_name": "Уведомления на земляные работы — линии",
+              "geometry_type": "line",
+              "symbology": {
+                "color": "#8B4513",
+                "width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62501_polygons",
+              "display_name": "Уведомления на земляные работы — полигоны",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#8B4513",
+                "outline_color": "#8B4513",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            }
+          ]
+        },
+        {
+          "group_name": "Действующие уведомления на аварийно-восстановительные работы и текущие локальные ремонты",
+          "layers": [
+            {
+              "table_name": "items_62441_points",
+              "display_name": "Текущие локальные ремонты — точки",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#3B1F0B",
+                "size": 3
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62441_lines",
+              "display_name": "Текущие локальные ремонты — линии",
+              "geometry_type": "line",
+              "symbology": {
+                "color": "#3B1F0B",
+                "width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62441_polygons",
+              "display_name": "Текущие локальные ремонты — полигоны",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#3B1F0B",
+                "outline_color": "#3B1F0B",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62461_points",
+              "display_name": "Аварийно-восстановительные работы — точки",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#DEB887",
+                "size": 3
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62461_lines",
+              "display_name": "Аварийно-восстановительные работы — линии",
+              "geometry_type": "line",
+              "symbology": {
+                "color": "#DEB887",
+                "width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62461_polygons",
+              "display_name": "Аварийно-восстановительные работы — полигоны",
+              "geometry_type": "polygon",
+              "symbology": {
+                "fill_color": "#DEB887",
+                "outline_color": "#DEB887",
+                "fill_opacity": 0.5,
+                "outline_width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            }
+          ]
         }
       ]
     },
     {
-      "group_name": "Объекты капитального строительства",
+      "group_name": "Границы районов",
       "layers": [
         {
-          "table_name": "items_2941",
-          "display_name": "Точки капитального строительства",
-          "geometry_type": "point",
-          "symbology": {
-            "color": "#000000",
-            "size": 4,
-            "marker_type": "square"
-          },
-          "schema": "data_mos",
-          "geometry_column": "geom"
-        },
-        {
-          "table_name": "url_222",
-          "display_name": "Полигоны капитального строительства",
+          "table_name": "hood",
+          "display_name": "Границы районов",
           "geometry_type": "polygon",
           "symbology": {
-            "fill_color": "#808080",
-            "outline_color": "#808080",
-            "fill_opacity": 0.5,
-            "outline_width": 1.0
-          },
-          "schema": "vector_stroy",
-          "geometry_column": "geom"
-        },
-        {
-          "table_name": "boundaries_aip",
-          "display_name": "Полигоны СтройМониторинг",
-          "geometry_type": "polygon",
-          "symbology": {
-            "fill_color": "#404040",
-            "outline_color": "#404040",
-            "fill_opacity": 0.5,
-            "outline_width": 1.0
-          },
-          "schema": "stroymonitoring",
-          "geometry_column": "geom_valid"
-        }
-      ]
-    },
-    {
-      "group_name": "Данные о действующих зарегистрированных уведомлениях на проведение земляных работ",
-      "layers": [
-        {
-          "table_name": "items_62501",
-          "display_name": "Данные о действующих зарегистрированных уведомлениях на проведение земляных работ",
-          "geometry_type": [
-            "polygon",
-            "line",
-            "point"
-          ],
-          "symbology": {
-            "point": {
-              "color": "#8B4513",
-              "size": 3
-            },
-            "line": {
-              "color": "#8B4513",
-              "width": 1.0
-            },
-            "polygon": {
-              "fill_color": "#8B4513",
-              "outline_color": "#8B4513",
-              "fill_opacity": 0.5,
-              "outline_width": 1.0
-            }
-          },
-          "schema": "data_mos",
-          "geometry_column": "geom",
-          "primary_key": "id",
-          "mixed_geometry": true
-        }
-      ]
-    },
-    {
-      "group_name": "Действующие уведомления на аварийно-восстановительные работы и текущие локальные ремонты",
-      "layers": [
-        {
-          "table_name": "items_62441",
-          "display_name": "Текущие локальные ремонты",
-          "geometry_type": [
-            "point",
-            "polygon"
-          ],
-          "symbology": {
-            "point": {
-              "color": "#3B1F0B",
-              "size": 3
-            },
-            "polygon": {
-              "fill_color": "#3B1F0B",
-              "outline_color": "#3B1F0B",
-              "fill_opacity": 0.5,
-              "outline_width": 1.0
-            }
-          },
-          "schema": "data_mos",
-          "geometry_column": "geom",
-          "primary_key": "id",
-          "mixed_geometry": true
-        },
-        {
-          "table_name": "items_62461",
-          "display_name": "Действующие уведомления на аварийно-восстановительные работы",
-          "geometry_type": [
-            "line",
-            "polygon"
-          ],
-          "symbology": {
-            "line": {
-              "color": "#DEB887",
-              "width": 1.0
-            },
-            "polygon": {
-              "fill_color": "#DEB887",
-              "outline_color": "#DEB887",
-              "fill_opacity": 0.5,
-              "outline_width": 1.0
-            }
-          },
-          "schema": "data_mos",
-          "geometry_column": "geom",
-          "primary_key": "id",
-          "mixed_geometry": true
-        }
-      ]
-    },
-    {
-      "group_name": "Данные Обьектив",
-      "layers": [
-        {
-          "table_name": "reports",
-          "display_name": "Фото разрытий и строек",
-          "geometry_type": "point",
-          "symbology": {
-            "complex_marker": true,
-            "center_color": "#000000",
-            "outer_color": "#FF0000",
-            "outer_width": 2,
-            "size": 6,
-            "marker_type": "circle_with_border"
-          },
-          "schema": "lens",
-          "geometry_column": "geom"
-        },
-        {
-          "table_name": "contours",
-          "display_name": "Контура всех строек",
-          "geometry_type": "polygon",
-          "symbology": {
-            "fill_color": "#FF0000",
+            "fill_opacity": 0,
             "outline_color": "#FF0000",
-            "fill_opacity": 0.5,
-            "outline_width": 1.0
+            "outline_width": 2.0,
+            "outline_style": "solid"
           },
-          "schema": "lens",
-          "geometry_column": "geometry"
-        },
-        {
-          "table_name": "contours_wip",
-          "display_name": "Контура в работе",
-          "geometry_type": "polygon",
-          "symbology": {
-            "fill_color": "#FFFF00",
-            "outline_color": "#FFFF00",
-            "fill_opacity": 0.5,
-            "outline_width": 1.0
-          },
-          "schema": "lens",
-          "geometry_column": "geometry"
-        },
-        {
-          "table_name": "contours_done",
-          "display_name": "Контура выполненые",
-          "geometry_type": "polygon",
-          "symbology": {
-            "fill_color": "#008000",
-            "outline_color": "#008000",
-            "fill_opacity": 0.5,
-            "outline_width": 1.0
-          },
-          "schema": "lens",
-          "geometry_column": "geometry"
+          "schema": "odh_export",
+          "geometry_column": "geom"
         }
       ]
     },
     {
-      "group_name": "Данные от ГенПлан",
-      "layers": [
-        {
-          "table_name": "responses",
-          "display_name": "Фотографии после обработки ИИ",
-          "geometry_type": "point",
-          "symbology": {
-            "color": "#FF0000",
-            "size": 4,
-            "marker_type": "circle"
-          },
-          "schema": "genplan",
-          "geometry_column": "photo_geom"
-        },
-        {
-          "table_name": "responses",
-          "display_name": "Полигоны заказов по фотографиям",
-          "geometry_type": "polygon",
-          "symbology": {
-            "fill_color": "#800000",
-            "outline_color": "#800000",
-            "fill_opacity": 0.75,
-            "outline_width": 1.0
-          },
-          "schema": "genplan",
-          "geometry_column": "geom"
-        }
-      ]
-    }
-  ],
-  "ungrouped_layers": [
-    {
-      "table_name": "hood",
-      "display_name": "Границы районов",
-      "geometry_type": "polygon",
-      "symbology": {
-        "fill_opacity": 0,
-        "outline_color": "#FF0000",
-        "outline_width": 2.0,
-        "outline_style": "solid"
-      },
-      "schema": "odh_export",
-      "geometry_column": "geom"
-    }
-  ],
-  "ungrouped_groups": [
-    {
-      "group_name": "Собственность",
+      "group_name": "Объекты ДГИ",
       "default_visibility": false,
       "layers": [
         {
@@ -406,11 +463,11 @@
     }
   },
   "database_schemas": {
-    "data_mos": "Камеры ЕЦХД, ордера ОАТИ, уведомления",
+    "data_mos": "Камеры ЕЦХД, ордера ОАТИ, уведомления (items_*_points/lines/polygons)",
     "vector_stroy": "Полигоны капитального строительства",
     "stroymonitoring": "СтройМониторинг",
     "lens": "Данные Объектив",
     "genplan": "Данные ГенПлан",
-    "odh_export": "Границы районов, собственность"
+    "odh_export": "Границы районов, объекты ДГИ"
   }
 }

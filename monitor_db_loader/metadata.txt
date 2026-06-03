@@ -3,7 +3,7 @@ name=Monitor DB Loader
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Подключение к PostgreSQL и загрузка пространственных слоёв с символикой из JSON (целевая версия QGIS 3.44 LTR)
-version=1.2.4
+version=1.3.0
 author=Monitor
 email=
 
