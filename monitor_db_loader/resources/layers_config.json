@@ -384,9 +384,29 @@
       ]
     },
     {
-      "group_name": "Объекты ДГИ",
+      "group_name": "Объекты ДГИ и ООЗТ",
       "default_visibility": false,
       "layers": [
+        {
+          "table_name": "oozt",
+          "display_name": "ООЗТ",
+          "geometry_type": "polygon",
+          "schema": "odh_export",
+          "geometry_column": "geom",
+          "primary_key": "id",
+          "symbology": {
+            "fill_color": "#90EE90",
+            "fill_opacity": 0.5,
+            "outline_color": "#90EE90",
+            "outline_width": 1.0,
+            "hatch": {
+              "enabled": true,
+              "color": "#FFFFFF",
+              "angle": 45,
+              "spacing": 5
+            }
+          }
+        },
         {
           "table_name": "dgi",
           "display_name": "город Москва",
@@ -454,7 +474,7 @@
     }
   ],
   "additional_functionality": {
-    "load_on_startup": true,
+    "load_on_startup": false,
     "auto_refresh": false,
     "password_remember": false,
     "error_handling": {
@@ -468,6 +488,6 @@
     "stroymonitoring": "СтройМониторинг",
     "lens": "Данные Объектив",
     "genplan": "Данные ГенПлан",
-    "odh_export": "Границы районов, объекты ДГИ"
+    "odh_export": "Границы районов, объекты ДГИ, ООЗТ (oozt)"
   }
 }
