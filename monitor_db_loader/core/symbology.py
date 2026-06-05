@@ -209,6 +209,8 @@ def _create_point_symbol(symbology: Dict[str, Any]) -> QgsMarkerSymbol:
     marker_type = symbology.get("marker_type", "circle")
     if marker_type == "square":
         layer.setShape(QgsSimpleMarkerSymbolLayer.Square)
+    elif marker_type in ("pyramid", "triangle"):
+        layer.setShape(QgsSimpleMarkerSymbolLayer.Triangle)
     else:
         layer.setShape(QgsSimpleMarkerSymbolLayer.Circle)
     layer.setSize(float(symbology.get("size", 3)))

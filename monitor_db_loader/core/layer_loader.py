@@ -4,11 +4,12 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Union
 
-from qgis.core import QgsMessageLog, QgsProject, Qgis
+from qgis.core import QgsMessageLog, QgsProject, QgsVectorLayer, Qgis
 from qgis.PyQt.QtWidgets import QMessageBox
 
 from .config import (
     LOG_CHANNEL,
+    additional_functionality,
     iter_all_layer_defs,
     layer_groups,
     ungrouped_layer_groups,
@@ -87,6 +88,14 @@ class LayerLoader:
         if group_def.get("default_visibility") is False:
             group_node.setItemVisibilityChecked(False)
 
+        collapsed = group_def.get("collapsed")
+        if collapsed is None:
+            collapsed = additional_functionality(self.config).get(
+                "collapse_groups_on_load", True
+            )
+        if collapsed:
+            group_node.setExpanded(False)
+
         for layer_def in group_def.get("layers", []):
             self._load_single(layer_def, group_node, result)
 
@@ -95,6 +104,20 @@ class LayerLoader:
 
     def _load_single(self, layer_def: Dict[str, Any], group_node, result: LoadResult):
         display_name = layer_def.get("display_name", layer_def.get("table_name", ""))
+
+        if layer_def.get("placeholder"):
+            layer = self._create_placeholder_layer(layer_def, display_name)
+            if layer is None:
+                result.failed += 1
+                msg = f"Слой «{display_name}»: не удалось создать пустой слой"
+                result.errors.append(msg)
+                QgsMessageLog.logMessage(msg, LOG_CHANNEL, Qgis.Warning)
+                return
+            self._add_layer(layer, layer_def, group_node, result)
+            result.loaded += 1
+            log_info(f"  → пустой слой-заглушка «{display_name}»")
+            return
+
         layers_or_layer, err = self.connection.create_vector_layer(
             layer_def, display_name
         )
@@ -164,6 +187,23 @@ class LayerLoader:
         tree_layer = self.root.findLayer(layer.id())
         if tree_layer and layer_def.get("default_visibility") is False:
             tree_layer.setItemVisibilityChecked(False)
+
+    @staticmethod
+    def _create_placeholder_layer(
+        layer_def: Dict[str, Any], display_name: str
+    ) -> Union[QgsVectorLayer, None]:
+        gtype = str(layer_def.get("geometry_type", "point")).lower()
+        wkt_type = {
+            "point": "Point",
+            "line": "LineString",
+            "polygon": "Polygon",
+        }.get(gtype, "Point")
+        layer = QgsVectorLayer(
+            f"{wkt_type}?crs=EPSG:4326", display_name, "memory"
+        )
+        if not layer.isValid():
+            return None
+        return layer
 
     @staticmethod
     def show_summary(result: LoadResult, parent=None):

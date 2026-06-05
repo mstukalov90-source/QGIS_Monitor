@@ -51,8 +51,8 @@ def parse_table_name(table_name: str) -> tuple:
 
 # Устаревшие имена из первой версии конфига (до обхода схем БД)
 _LEGACY_LAYER_SOURCES = {
-    "response.photo_geom": ("genplan", "responses", "photo_geom"),
-    "response.geom": ("genplan", "responses", "geom"),
+    "response.photo_geom": ("genplan", "photo_meta", "geom"),
+    "response.geom": ("genplan", "order", "geom"),
     "boundaries_aip.geom_valid": ("stroymonitoring", "boundaries_aip", "geom_valid"),
 }
 
