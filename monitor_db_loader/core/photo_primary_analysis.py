@@ -8,7 +8,6 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
-    QgsField,
     QgsFields,
     QgsGeometry,
     QgsLayerTree,
@@ -24,7 +23,25 @@ from qgis.PyQt.QtWidgets import QApplication, QMessageBox, QProgressDialog
 from .config import photo_primary_analysis
 from .layer_utils import refresh_map_canvas
 from .log_util import log_info, log_warning
+from .qt_compat import qgs_field
 from .symbology import apply_symbology
+
+WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+
+def _transform_context():
+    return QgsProject.instance().transformContext()
+
+
+def _to_wgs84(geom: QgsGeometry, crs: QgsCoordinateReferenceSystem) -> QgsGeometry:
+    """Перепроецировать геометрию в EPSG:4326 для отображения."""
+    result = QgsGeometry(geom)
+    if not crs.isValid() or crs == WGS84:
+        return result
+    result.transform(
+        QgsCoordinateTransform(crs, WGS84, _transform_context())
+    )
+    return result
 
 
 @dataclass
@@ -33,6 +50,23 @@ class SourcePoint:
     feature: QgsFeature
     metric_geom: QgsGeometry
     key: Tuple[str, int]
+
+
+@dataclass
+class ReferenceMatch:
+    layer_id: str
+    layer_name: str
+    feature_id: int
+    distance_m: float
+    metric_geom: QgsGeometry
+    source_geom: QgsGeometry
+
+
+@dataclass
+class ClassifiedPoint:
+    source: SourcePoint
+    category: str
+    matches: List[ReferenceMatch] = field(default_factory=list)
 
 
 @dataclass
@@ -48,7 +82,7 @@ class ReferenceIndex:
     """Пространственный индекс опорных объектов в метрической СК."""
 
     def __init__(self, metric_crs: QgsCoordinateReferenceSystem):
-        self._geometries: Dict[int, QgsGeometry] = {}
+        self._records: Dict[int, ReferenceMatch] = {}
         self._index = QgsSpatialIndex()
         self._metric_crs = metric_crs
         self._next_id = 0
@@ -58,7 +92,7 @@ class ReferenceIndex:
             return 0
         project = QgsProject.instance()
         transform = QgsCoordinateTransform(
-            layer.crs(), self._metric_crs, project
+            layer.crs(), self._metric_crs, _transform_context()
         )
         count = 0
         for feat in layer.getFeatures():
@@ -74,7 +108,15 @@ class ReferenceIndex:
                 continue
             idx = self._next_id
             self._next_id += 1
-            self._geometries[idx] = metric_geom
+            record = ReferenceMatch(
+                layer_id=layer.id(),
+                layer_name=layer.name(),
+                feature_id=feat.id(),
+                distance_m=0.0,
+                metric_geom=metric_geom,
+                source_geom=QgsGeometry(geom),
+            )
+            self._records[idx] = record
             index_feat = QgsFeature()
             index_feat.setId(idx)
             index_feat.setGeometry(metric_geom)
@@ -82,19 +124,36 @@ class ReferenceIndex:
             count += 1
         return count
 
-    def within(self, point: QgsGeometry, radius_m: float) -> bool:
-        if not self._geometries:
-            return False
+    def find_matches(self, point: QgsGeometry, radius_m: float) -> List[ReferenceMatch]:
+        if not self._records:
+            return []
+        matches: List[ReferenceMatch] = []
         search_rect = point.buffer(radius_m, 8).boundingBox()
         for idx in self._index.intersects(search_rect):
-            ref_geom = self._geometries.get(idx)
-            if ref_geom and ref_geom.distance(point) <= radius_m:
-                return True
-        return False
+            record = self._records.get(idx)
+            if not record:
+                continue
+            dist = record.metric_geom.distance(point)
+            if dist <= radius_m:
+                matches.append(
+                    ReferenceMatch(
+                        layer_id=record.layer_id,
+                        layer_name=record.layer_name,
+                        feature_id=record.feature_id,
+                        distance_m=dist,
+                        metric_geom=record.metric_geom,
+                        source_geom=record.source_geom,
+                    )
+                )
+        matches.sort(key=lambda m: m.distance_m)
+        return matches
+
+    def within(self, point: QgsGeometry, radius_m: float) -> bool:
+        return bool(self.find_matches(point, radius_m))
 
     @property
     def count(self) -> int:
-        return len(self._geometries)
+        return len(self._records)
 
 
 def _collect_vector_layers(node) -> List[QgsVectorLayer]:
@@ -166,11 +225,12 @@ def _collect_source_points(
     layers: List[QgsVectorLayer],
     metric_crs: QgsCoordinateReferenceSystem,
 ) -> List[SourcePoint]:
-    project = QgsProject.instance()
     points: List[SourcePoint] = []
 
     for layer in layers:
-        transform = QgsCoordinateTransform(layer.crs(), metric_crs, project)
+        transform = QgsCoordinateTransform(
+            layer.crs(), metric_crs, _transform_context()
+        )
         layer_count = 0
         for feat in layer.getFeatures():
             geom = feat.geometry()
@@ -207,12 +267,34 @@ def _collect_source_points(
     return points
 
 
+def _format_ref_fields(
+    matches: List[ReferenceMatch], separator: str
+) -> Tuple[str, str, str]:
+    if not matches:
+        return "", "", ""
+    return (
+        separator.join(m.layer_name for m in matches),
+        separator.join(str(m.feature_id) for m in matches),
+        separator.join(f"{m.distance_m:.1f}" for m in matches),
+    )
+
+
 def _union_fields(sources: List[SourcePoint]) -> QgsFields:
     fields = QgsFields()
-    fields.append(QgsField("source_layer", QVariant.String))
-    fields.append(QgsField("source_fid", QVariant.Int))
-    fields.append(QgsField("category", QVariant.String))
-    seen: Set[str] = {"source_layer", "source_fid", "category"}
+    fields.append(qgs_field("source_layer", QVariant.String))
+    fields.append(qgs_field("source_fid", QVariant.Int))
+    fields.append(qgs_field("category", QVariant.String))
+    fields.append(qgs_field("ref_layers", QVariant.String))
+    fields.append(qgs_field("ref_fids", QVariant.String))
+    fields.append(qgs_field("ref_distances_m", QVariant.String))
+    seen: Set[str] = {
+        "source_layer",
+        "source_fid",
+        "category",
+        "ref_layers",
+        "ref_fids",
+        "ref_distances_m",
+    }
     for sp in sources:
         for f in sp.feature.fields():
             if f.name() not in seen:
@@ -225,7 +307,8 @@ def _create_result_layer(
     name: str,
     color: str,
     fields: QgsFields,
-    entries: List[Tuple[SourcePoint, str]],
+    entries: List[ClassifiedPoint],
+    ref_separator: str,
 ) -> Optional[QgsVectorLayer]:
     layer = QgsVectorLayer("Point?crs=EPSG:4326", name, "memory")
     if not layer.isValid():
@@ -236,13 +319,20 @@ def _create_result_layer(
     layer.updateFields()
 
     features: List[QgsFeature] = []
-    for sp, category in entries:
+    for entry in entries:
+        sp = entry.source
         feat = QgsFeature(fields)
         feat.setGeometry(sp.feature.geometry())
         attrs = {f.name(): sp.feature[f.name()] for f in sp.feature.fields()}
         attrs["source_layer"] = sp.layer.name()
         attrs["source_fid"] = sp.feature.id()
-        attrs["category"] = category
+        attrs["category"] = entry.category
+        ref_layers, ref_fids, ref_distances = _format_ref_fields(
+            entry.matches, ref_separator
+        )
+        attrs["ref_layers"] = ref_layers
+        attrs["ref_fids"] = ref_fids
+        attrs["ref_distances_m"] = ref_distances
         for i, fld in enumerate(fields):
             if fld.name() in attrs:
                 feat.setAttribute(i, attrs[fld.name()])
@@ -256,6 +346,95 @@ def _create_result_layer(
         {
             "geometry_type": "point",
             "symbology": {"color": color, "size": 5, "marker_type": "circle"},
+        },
+    )
+    return layer
+
+
+def _link_line_geometry(
+    sp: SourcePoint,
+    match: ReferenceMatch,
+) -> Optional[QgsGeometry]:
+    """Кратчайшая линия между фото и опорным объектом в EPSG:4326."""
+    project = QgsProject.instance()
+    ref_layer = project.mapLayer(match.layer_id)
+
+    photo_crs = sp.layer.crs() if sp.layer.crs().isValid() else WGS84
+    ref_crs = (
+        ref_layer.crs()
+        if ref_layer and ref_layer.crs().isValid()
+        else WGS84
+    )
+
+    photo_g = _to_wgs84(sp.feature.geometry(), photo_crs)
+
+    ref_geom = match.source_geom
+    if ref_layer:
+        ref_feat = ref_layer.getFeature(match.feature_id)
+        if ref_feat.isValid() and ref_feat.geometry() and not ref_feat.geometry().isEmpty():
+            ref_geom = ref_feat.geometry()
+
+    ref_g = _to_wgs84(ref_geom, ref_crs)
+    if photo_g.isEmpty() or ref_g.isEmpty():
+        return None
+
+    line = photo_g.shortestLine(ref_g)
+    if line.isEmpty():
+        return None
+    return line
+
+
+def _create_link_layer(
+    name: str,
+    symbology: Dict[str, Any],
+    classified: List[ClassifiedPoint],
+) -> Optional[QgsVectorLayer]:
+    layer = QgsVectorLayer("LineString?crs=EPSG:4326", name, "memory")
+    if not layer.isValid():
+        return None
+
+    fields = QgsFields()
+    fields.append(qgs_field("photo_layer", QVariant.String))
+    fields.append(qgs_field("photo_fid", QVariant.Int))
+    fields.append(qgs_field("ref_layer", QVariant.String))
+    fields.append(qgs_field("ref_fid", QVariant.Int))
+    fields.append(qgs_field("distance_m", QVariant.Double))
+
+    provider = layer.dataProvider()
+    provider.addAttributes(fields.toList())
+    layer.updateFields()
+
+    features: List[QgsFeature] = []
+    for entry in classified:
+        sp = entry.source
+        for match in entry.matches:
+            line_geom = _link_line_geometry(sp, match)
+            if not line_geom or line_geom.isEmpty():
+                continue
+            feat = QgsFeature(fields)
+            feat.setGeometry(line_geom)
+            feat.setAttributes(
+                [
+                    sp.layer.name(),
+                    sp.feature.id(),
+                    match.layer_name,
+                    match.feature_id,
+                    round(match.distance_m, 1),
+                ]
+            )
+            features.append(feat)
+
+    if not features:
+        return None
+
+    provider.addFeatures(features)
+    layer.updateExtents()
+
+    apply_symbology(
+        layer,
+        {
+            "geometry_type": "line",
+            "symbology": symbology,
         },
     )
     return layer
@@ -290,12 +469,14 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
     metric_crs = QgsCoordinateReferenceSystem(cfg.get("metric_crs", "EPSG:32637"))
     radius_green = float(cfg.get("radius_green_m", 100))
     radius_yellow = float(cfg.get("radius_yellow_m", 250))
+    ref_separator = cfg.get("ref_field_separator", "; ")
+    link_layers_cfg = cfg.get("link_layers", {})
 
     progress = QProgressDialog(
         "Первичный анализ фото…",
         "Отмена",
         0,
-        5,
+        6,
         parent or iface.mainWindow(),
     )
     progress.setWindowTitle("Monitor DB Loader")
@@ -394,17 +575,20 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
         log_info(f"  Группа Б «{lyr.name()}»: {cnt} объектов")
     log_info(f"Индекс Группы Б: {index_b.count} объектов")
 
-    green: List[SourcePoint] = []
-    yellow: List[SourcePoint] = []
-    red: List[SourcePoint] = []
+    green: List[ClassifiedPoint] = []
+    yellow: List[ClassifiedPoint] = []
+    red: List[ClassifiedPoint] = []
 
     for sp in source_points:
-        if index_a.within(sp.metric_geom, radius_green):
-            green.append(sp)
-        elif index_b.within(sp.metric_geom, radius_yellow):
-            yellow.append(sp)
+        matches_a = index_a.find_matches(sp.metric_geom, radius_green)
+        if matches_a:
+            green.append(ClassifiedPoint(sp, "green", matches_a))
         else:
-            red.append(sp)
+            matches_b = index_b.find_matches(sp.metric_geom, radius_yellow)
+            if matches_b:
+                yellow.append(ClassifiedPoint(sp, "yellow", matches_b))
+            else:
+                red.append(ClassifiedPoint(sp, "red", []))
 
     log_info(
         f"Классификация: зелёная={len(green)}, "
@@ -418,7 +602,7 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
         return AnalysisResult()
 
     _remove_result_group(result_group)
-    group_node = root.addGroup(result_group)
+    group_node = root.insertGroup(0, result_group)
 
     fields = _union_fields(source_points)
     results_cfg = cfg.get("results", [])
@@ -430,12 +614,13 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
 
     for res_def in results_cfg:
         cat = res_def.get("category", "")
-        entries = [(sp, cat) for sp in category_map.get(cat, [])]
+        entries = category_map.get(cat, [])
         res_layer = _create_result_layer(
             res_def.get("name", cat),
             res_def.get("color", "#000000"),
             fields,
             entries,
+            ref_separator,
         )
         if res_layer:
             QgsProject.instance().addMapLayer(res_layer, False)
@@ -443,6 +628,31 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
             log_info(f"  → «{res_layer.name()}»: {len(entries)} точек")
 
     progress.setValue(5)
+    progress.setLabelText("Построение линий связей…")
+    QApplication.processEvents()
+    if progress.wasCanceled():
+        return AnalysisResult()
+
+    for cat_key, classified in (("green", green), ("yellow", yellow)):
+        link_def = link_layers_cfg.get(cat_key, {})
+        if not link_def or not classified:
+            continue
+        symbology = {
+            "color": link_def.get("color", "#000000"),
+            "width": link_def.get("width", 0.8),
+            "style": link_def.get("style", "dash"),
+        }
+        link_layer = _create_link_layer(
+            link_def.get("name", f"Связи {cat_key}"),
+            symbology,
+            classified,
+        )
+        if link_layer:
+            QgsProject.instance().addMapLayer(link_layer, False)
+            group_node.addLayer(link_layer)
+            log_info(f"  → «{link_layer.name()}»: {link_layer.featureCount()} линий")
+
+    progress.setValue(6)
     progress.close()
 
     refresh_map_canvas(iface)

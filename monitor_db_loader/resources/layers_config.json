@@ -1,7 +1,7 @@
 {
   "project": "QGIS Plugin Development",
   "task": "Database connection and layer visualization plugin",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Plugin for connecting to PostgreSQL database and displaying spatial layers with predefined symbology",
   "database_connection": {
     "host": "77.222.63.161",
@@ -353,6 +353,7 @@
     },
     {
       "group_name": "Справочная информация",
+      "default_visibility": false,
       "groups": [
         {
           "group_name": "Камеры ЕЦХД",
@@ -533,7 +534,22 @@
       { "name": "Зелёная таблица", "color": "#008000", "category": "green" },
       { "name": "Жёлтая таблица", "color": "#FFD700", "category": "yellow" },
       { "name": "Красная таблица", "color": "#FF0000", "category": "red" }
-    ]
+    ],
+    "link_layers": {
+      "green": {
+        "name": "Зелёные связи",
+        "color": "#008000",
+        "width": 0.8,
+        "style": "dash"
+      },
+      "yellow": {
+        "name": "Жёлтые связи",
+        "color": "#FFD700",
+        "width": 0.8,
+        "style": "dash"
+      }
+    },
+    "ref_field_separator": "; "
   },
   "additional_functionality": {
     "load_on_startup": false,

@@ -1,8 +1,22 @@
 # -*- coding: utf-8 -*-
 """Qt5 (QGIS 3.x) / Qt6 (QGIS 4.x) compatibility shims."""
 
-from qgis.PyQt.QtCore import QT_VERSION, Qt
+from qgis.PyQt.QtCore import QT_VERSION, Qt, QVariant
 from qgis.PyQt.QtWidgets import QDialog, QDialogButtonBox, QLineEdit, QMessageBox
+
+try:
+    from qgis.PyQt.QtCore import QMetaType
+
+    _QVARIANT_TO_METATYPE = {
+        QVariant.String: QMetaType.Type.QString,
+        QVariant.Int: QMetaType.Type.Int,
+        QVariant.LongLong: QMetaType.Type.LongLong,
+        QVariant.Double: QMetaType.Type.Double,
+        QVariant.Bool: QMetaType.Type.Bool,
+    }
+except (ImportError, AttributeError):
+    QMetaType = None  # type: ignore[misc, assignment]
+    _QVARIANT_TO_METATYPE = {}
 
 IS_QT6 = QT_VERSION >= 0x060000
 
@@ -56,3 +70,17 @@ def dialog_exec(dialog) -> int:
     if IS_QT6:
         return dialog.exec()
     return dialog.exec_()
+
+
+def qgs_field(name: str, field_type: int):
+    """QgsField без DeprecationWarning (QGIS 3.38+: setMetaType вместо конструктора)."""
+    from qgis.core import QgsField
+
+    field = QgsField()
+    field.setName(name)
+    meta_type = _QVARIANT_TO_METATYPE.get(field_type)
+    if meta_type is not None and hasattr(field, "setMetaType"):
+        field.setMetaType(meta_type)
+    else:
+        field.setType(field_type)
+    return field

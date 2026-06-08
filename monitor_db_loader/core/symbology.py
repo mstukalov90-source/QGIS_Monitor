@@ -230,6 +230,11 @@ def _create_line_symbol(symbology: Dict[str, Any]) -> QgsLineSymbol:
     layer = QgsSimpleLineSymbolLayer()
     layer.setColor(_color(symbology.get("color", "#000000")))
     layer.setWidth(float(symbology.get("width", 1.0)))
+    style = symbology.get("style", symbology.get("outline_style", "solid"))
+    if style == "dash":
+        layer.setPenStyle(PEN_DASH)
+    else:
+        layer.setPenStyle(PEN_SOLID)
     symbol.appendSymbolLayer(layer)
     return symbol
 
