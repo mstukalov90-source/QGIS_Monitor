@@ -1,7 +1,7 @@
 {
   "project": "QGIS Plugin Development",
   "task": "Database connection and layer visualization plugin",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Plugin for connecting to PostgreSQL database and displaying spatial layers with predefined symbology",
   "database_connection": {
     "host": "77.222.63.161",
@@ -508,6 +508,33 @@
       ]
     }
   ],
+  "photo_primary_analysis": {
+    "result_group": "Первичный анализ фото",
+    "metric_crs": "EPSG:32637",
+    "radius_green_m": 100,
+    "radius_yellow_m": 250,
+    "source_layers": [
+      "Фотографии после обработки ИИ",
+      "Фото разрытий и строек"
+    ],
+    "group_a": {
+      "layers": ["Разрытия из паспортов ОГХ"],
+      "groups": [
+        "Ордера ОАТИ",
+        "Данные о действующих зарегистрированных уведомлениях на проведение земляных работ",
+        "Действующие уведомления на аварийно-восстановительные работы и текущие локальные ремонты"
+      ]
+    },
+    "group_b_extra": {
+      "layers": ["Полигоны СтройМониторинг"],
+      "groups": ["Объекты капитального строительства"]
+    },
+    "results": [
+      { "name": "Зелёная таблица", "color": "#008000", "category": "green" },
+      { "name": "Жёлтая таблица", "color": "#FFD700", "category": "yellow" },
+      { "name": "Красная таблица", "color": "#FF0000", "category": "red" }
+    ]
+  },
   "additional_functionality": {
     "load_on_startup": false,
     "auto_refresh": false,

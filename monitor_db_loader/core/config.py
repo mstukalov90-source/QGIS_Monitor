@@ -41,6 +41,10 @@ def load_on_startup(config: Dict[str, Any]) -> bool:
     return bool(additional_functionality(config).get("load_on_startup", False))
 
 
+def photo_primary_analysis(config: Dict[str, Any]) -> Dict[str, Any]:
+    return config.get("photo_primary_analysis", {})
+
+
 def parse_table_name(table_name: str) -> tuple:
     """Return (schema, table) from 'table' or 'schema.table'."""
     if "." in table_name:
