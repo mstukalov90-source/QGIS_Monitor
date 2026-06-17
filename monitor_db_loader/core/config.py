@@ -45,6 +45,14 @@ def photo_primary_analysis(config: Dict[str, Any]) -> Dict[str, Any]:
     return config.get("photo_primary_analysis", {})
 
 
+def crm_tasks(config: Dict[str, Any]) -> Dict[str, Any]:
+    return config.get("crm_tasks", {})
+
+
+def crm_task_store(config: Dict[str, Any]) -> Dict[str, Any]:
+    return crm_tasks(config).get("task_store", {})
+
+
 def parse_table_name(table_name: str) -> tuple:
     """Return (schema, table) from 'table' or 'schema.table'."""
     if "." in table_name:

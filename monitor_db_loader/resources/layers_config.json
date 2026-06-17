@@ -1,7 +1,7 @@
 {
   "project": "QGIS Plugin Development",
   "task": "Database connection and layer visualization plugin",
-  "version": "1.7.0",
+  "version": "1.12.6",
   "description": "Plugin for connecting to PostgreSQL database and displaying spatial layers with predefined symbology",
   "database_connection": {
     "host": "77.222.63.161",
@@ -308,6 +308,18 @@
               "primary_key": "id"
             },
             {
+              "table_name": "items_62441_lines",
+              "display_name": "Текущие локальные ремонты — линии",
+              "geometry_type": "line",
+              "symbology": {
+                "color": "#3B1F0B",
+                "width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
               "table_name": "items_62441_polygons",
               "display_name": "Текущие локальные ремонты — полигоны",
               "geometry_type": "polygon",
@@ -316,6 +328,18 @@
                 "outline_color": "#3B1F0B",
                 "fill_opacity": 0.5,
                 "outline_width": 1.0
+              },
+              "schema": "data_mos",
+              "geometry_column": "geom",
+              "primary_key": "id"
+            },
+            {
+              "table_name": "items_62461_points",
+              "display_name": "Аварийно-восстановительные работы — точки",
+              "geometry_type": "point",
+              "symbology": {
+                "color": "#DEB887",
+                "size": 3
               },
               "schema": "data_mos",
               "geometry_column": "geom",
@@ -512,11 +536,12 @@
   "photo_primary_analysis": {
     "result_group": "Первичный анализ фото",
     "metric_crs": "EPSG:32637",
-    "radius_green_m": 100,
-    "radius_yellow_m": 250,
+    "radius_green_m": 25,
+    "radius_yellow_m": 50,
     "source_layers": [
       "Фотографии после обработки ИИ",
-      "Фото разрытий и строек"
+      "Фото разрытий и строек",
+      "Разрытия из паспортов ОГХ"
     ],
     "group_a": {
       "layers": ["Разрытия из паспортов ОГХ"],
@@ -549,7 +574,107 @@
         "style": "dash"
       }
     },
-    "ref_field_separator": "; "
+    "ref_field_separator": "; ",
+    "district_filter": {
+      "boundaries_layer": "Границы районов",
+      "field": "rayon"
+    }
+  },
+  "crm_tasks": {
+    "metric_crs": "EPSG:32637",
+    "date_lookback_days": 3,
+    "district_filter": {
+      "boundaries_layer": "Границы районов",
+      "field": "rayon"
+    },
+    "groups": [
+      {
+        "name": "Разрытия",
+        "subgroups": [
+          {
+            "name": "Фото после обработки ИИ",
+            "layers": ["Фотографии после обработки ИИ"]
+          },
+          {
+            "name": "Фото разрытий и строек",
+            "layers": ["Фото разрытий и строек"]
+          },
+          {
+            "name": "Разрытия из полигонов ОГХ",
+            "layers": ["Разрытия из паспортов ОГХ"]
+          }
+        ]
+      },
+      {
+        "name": "Новые ордера ОАТИ, АВР и земляные работы",
+        "subgroups": [
+          {
+            "name": "Ордера ОАТИ",
+            "groups": ["Ордера ОАТИ"],
+            "date_field": "order_date"
+          },
+          {
+            "name": "Уведомления на земляные работы",
+            "groups": [
+              "Данные о действующих зарегистрированных уведомлениях на проведение земляных работ"
+            ],
+            "date_field": "work_start_date"
+          },
+          {
+            "name": "Текущие локальные ремонты",
+            "layers": [
+              "Текущие локальные ремонты — точки",
+              "Текущие локальные ремонты — линии",
+              "Текущие локальные ремонты — полигоны"
+            ],
+            "date_field": "actual_start_date"
+          },
+          {
+            "name": "Аварийно-восстановительные работы",
+            "layers": [
+              "Аварийно-восстановительные работы — точки",
+              "Аварийно-восстановительные работы — линии",
+              "Аварийно-восстановительные работы — полигоны"
+            ],
+            "date_field": "work_start_date"
+          }
+        ]
+      }
+    ],
+    "task_store": {
+      "schema": "crm",
+      "table": "tasks",
+      "subgroups": {
+        "Фото после обработки ИИ": {
+          "task_column": "photo_uuid",
+          "source_field": "uuid"
+        },
+        "Фото разрытий и строек": {
+          "task_column": "photo_lens",
+          "source_field": "external_report_id"
+        },
+        "Разрытия из полигонов ОГХ": {
+          "task_column": "ogh_id",
+          "source_field": "id"
+        },
+        "Ордера ОАТИ": {
+          "task_column": "oati_id",
+          "source_field": "order_number"
+        },
+        "Уведомления на земляные работы": {
+          "task_column": "earthwork_id",
+          "source_field": "registration_number_notifications"
+        },
+        "Текущие локальные ремонты": {
+          "task_column": "localwork_id",
+          "source_field": "global_id"
+        },
+        "Аварийно-восстановительные работы": {
+          "task_column": "avr_mos_id",
+          "source_field": "em_call_reg_num"
+        }
+      }
+    }
   },
   "additional_functionality": {
     "load_on_startup": false,

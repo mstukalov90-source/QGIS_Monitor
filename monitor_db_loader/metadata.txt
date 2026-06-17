@@ -3,7 +3,7 @@ name=Monitor DB Loader
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Подключение к БД агрегатору данных для мониторинга строек и разрытий. Целевая версия QGIS 3.44 LTR.
-version=1.7.0
+version=1.12.6
 author=StukalovMN
 email=
 

@@ -8,10 +8,9 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
+    QgsFeatureRequest,
     QgsFields,
     QgsGeometry,
-    QgsLayerTree,
-    QgsLayerTreeGroup,
     QgsProject,
     QgsSpatialIndex,
     QgsVectorLayer,
@@ -20,17 +19,21 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
+from ..ui.district_dialog import DistrictDialog
 from .config import photo_primary_analysis
+from .district_utils import (
+    WGS84,
+    DistrictBoundary,
+    district_bbox_for_layer,
+    find_layer_by_name,
+    load_district_boundary,
+    resolve_layers,
+    transform_context,
+)
 from .layer_utils import refresh_map_canvas
 from .log_util import log_info, log_warning
 from .qt_compat import qgs_field
 from .symbology import apply_symbology
-
-WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
-
-
-def _transform_context():
-    return QgsProject.instance().transformContext()
 
 
 def _to_wgs84(geom: QgsGeometry, crs: QgsCoordinateReferenceSystem) -> QgsGeometry:
@@ -39,7 +42,7 @@ def _to_wgs84(geom: QgsGeometry, crs: QgsCoordinateReferenceSystem) -> QgsGeomet
     if not crs.isValid() or crs == WGS84:
         return result
     result.transform(
-        QgsCoordinateTransform(crs, WGS84, _transform_context())
+        QgsCoordinateTransform(crs, WGS84, transform_context())
     )
     return result
 
@@ -87,15 +90,18 @@ class ReferenceIndex:
         self._metric_crs = metric_crs
         self._next_id = 0
 
-    def add_layer(self, layer: QgsVectorLayer) -> int:
+    def add_layer(
+        self, layer: QgsVectorLayer, district: DistrictBoundary
+    ) -> int:
         if not layer or not layer.isValid():
             return 0
-        project = QgsProject.instance()
         transform = QgsCoordinateTransform(
-            layer.crs(), self._metric_crs, _transform_context()
+            layer.crs(), self._metric_crs, transform_context()
         )
+        request = QgsFeatureRequest()
+        request.setFilterRect(district_bbox_for_layer(district, layer))
         count = 0
-        for feat in layer.getFeatures():
+        for feat in layer.getFeatures(request):
             geom = feat.geometry()
             if not geom or geom.isEmpty():
                 continue
@@ -105,6 +111,8 @@ class ReferenceIndex:
             except Exception:
                 continue
             if metric_geom.isEmpty():
+                continue
+            if not district.geom_metric.intersects(metric_geom):
                 continue
             idx = self._next_id
             self._next_id += 1
@@ -148,6 +156,20 @@ class ReferenceIndex:
         matches.sort(key=lambda m: m.distance_m)
         return matches
 
+    def find_matches_for_source(
+        self,
+        sp: "SourcePoint",
+        radius_m: float,
+    ) -> List[ReferenceMatch]:
+        """Совпадения для точки-источника, без самопопадания (тот же слой и fid)."""
+        return [
+            m
+            for m in self.find_matches(sp.metric_geom, radius_m)
+            if not (
+                m.layer_id == sp.layer.id() and m.feature_id == sp.feature.id()
+            )
+        ]
+
     def within(self, point: QgsGeometry, radius_m: float) -> bool:
         return bool(self.find_matches(point, radius_m))
 
@@ -156,83 +178,21 @@ class ReferenceIndex:
         return len(self._records)
 
 
-def _collect_vector_layers(node) -> List[QgsVectorLayer]:
-    layers: List[QgsVectorLayer] = []
-    if QgsLayerTree.isLayer(node):
-        lyr = node.layer()
-        if isinstance(lyr, QgsVectorLayer) and lyr.isValid():
-            layers.append(lyr)
-    elif isinstance(node, QgsLayerTreeGroup):
-        for child in node.children():
-            layers.extend(_collect_vector_layers(child))
-    return layers
-
-
-def _find_layer_by_name(root, name: str) -> Optional[QgsVectorLayer]:
-    for node in root.findLayers():
-        lyr = node.layer()
-        if isinstance(lyr, QgsVectorLayer) and lyr.name() == name:
-            return lyr
-    return None
-
-
-def _find_group_by_name(root, name: str) -> Optional[QgsLayerTreeGroup]:
-    group = root.findGroup(name)
-    if group:
-        return group
-    for child in root.children():
-        if isinstance(child, QgsLayerTreeGroup):
-            found = _find_group_by_name(child, name)
-            if found:
-                return found
-    return None
-
-
-def _resolve_layers(
-    root,
-    layer_names: List[str],
-    group_names: List[str],
-) -> Tuple[List[QgsVectorLayer], List[str]]:
-    found: List[QgsVectorLayer] = []
-    seen_ids: Set[str] = set()
-    missing: List[str] = []
-
-    for name in layer_names:
-        lyr = _find_layer_by_name(root, name)
-        if lyr and lyr.id() not in seen_ids:
-            found.append(lyr)
-            seen_ids.add(lyr.id())
-        elif lyr is None:
-            missing.append(name)
-
-    for name in group_names:
-        group = _find_group_by_name(root, name)
-        if group is None:
-            missing.append(name)
-            continue
-        group_layers = _collect_vector_layers(group)
-        if not group_layers:
-            log_warning(f"Группа «{name}» не содержит векторных слоёв")
-        for lyr in group_layers:
-            if lyr.id() not in seen_ids:
-                found.append(lyr)
-                seen_ids.add(lyr.id())
-
-    return found, missing
-
-
 def _collect_source_points(
     layers: List[QgsVectorLayer],
     metric_crs: QgsCoordinateReferenceSystem,
+    district: DistrictBoundary,
 ) -> List[SourcePoint]:
     points: List[SourcePoint] = []
 
     for layer in layers:
         transform = QgsCoordinateTransform(
-            layer.crs(), metric_crs, _transform_context()
+            layer.crs(), metric_crs, transform_context()
         )
+        request = QgsFeatureRequest()
+        request.setFilterRect(district_bbox_for_layer(district, layer))
         layer_count = 0
-        for feat in layer.getFeatures():
+        for feat in layer.getFeatures(request):
             geom = feat.geometry()
             if not geom or geom.isEmpty():
                 continue
@@ -250,6 +210,8 @@ def _collect_source_points(
                 )
                 continue
             if metric_geom.isEmpty():
+                continue
+            if not district.geom_metric.contains(metric_geom):
                 continue
             points.append(
                 SourcePoint(
@@ -465,12 +427,63 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
         )
         return AnalysisResult(errors=["Конфигурация не найдена"])
 
-    result_group = cfg.get("result_group", "Первичный анализ фото")
+    result_group_base = cfg.get("result_group", "Первичный анализ фото")
     metric_crs = QgsCoordinateReferenceSystem(cfg.get("metric_crs", "EPSG:32637"))
-    radius_green = float(cfg.get("radius_green_m", 100))
-    radius_yellow = float(cfg.get("radius_yellow_m", 250))
+    radius_green = float(cfg.get("radius_green_m", 25))
+    radius_yellow = float(cfg.get("radius_yellow_m", 50))
     ref_separator = cfg.get("ref_field_separator", "; ")
     link_layers_cfg = cfg.get("link_layers", {})
+    district_cfg = cfg.get("district_filter", {})
+
+    root = QgsProject.instance().layerTreeRoot()
+    boundaries_name = district_cfg.get("boundaries_layer", "Границы районов")
+    boundaries_field = district_cfg.get("field", "rayon")
+    boundaries_layer = find_layer_by_name(root, boundaries_name)
+
+    if boundaries_layer is None:
+        QMessageBox.warning(
+            parent or iface.mainWindow(),
+            "Monitor DB Loader — первичный анализ",
+            f"Слой «{boundaries_name}» не найден.\n\nСначала загрузите слои Monitor DB.",
+        )
+        return AnalysisResult(errors=[boundaries_name])
+
+    if boundaries_layer.fields().indexOf(boundaries_field) < 0:
+        QMessageBox.warning(
+            parent or iface.mainWindow(),
+            "Monitor DB Loader — первичный анализ",
+            f"В слое «{boundaries_name}» нет поля «{boundaries_field}».",
+        )
+        return AnalysisResult(errors=[boundaries_field])
+
+    if not DistrictDialog.list_rayons(boundaries_layer, boundaries_field):
+        QMessageBox.warning(
+            parent or iface.mainWindow(),
+            "Monitor DB Loader — первичный анализ",
+            f"В слое «{boundaries_name}» нет значений в поле «{boundaries_field}».",
+        )
+        return AnalysisResult(errors=["Нет районов"])
+
+    rayon = DistrictDialog.choose(
+        boundaries_layer, boundaries_field, parent or iface.mainWindow()
+    )
+    if rayon is None:
+        log_info("Первичный анализ фото: отменён пользователем")
+        return AnalysisResult()
+
+    district = load_district_boundary(
+        boundaries_layer, boundaries_field, rayon, metric_crs
+    )
+    if district is None:
+        QMessageBox.warning(
+            parent or iface.mainWindow(),
+            "Monitor DB Loader — первичный анализ",
+            f"Не удалось загрузить полигон района «{rayon}».",
+        )
+        return AnalysisResult(errors=[rayon])
+
+    result_group = f"{result_group_base} — {district.name}"
+    log_info(f"Первичный анализ фото: район «{district.name}»")
 
     progress = QProgressDialog(
         "Первичный анализ фото…",
@@ -483,24 +496,22 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
     progress.setMinimumDuration(0)
     progress.setValue(0)
 
-    root = QgsProject.instance().layerTreeRoot()
-
     progress.setLabelText("Поиск слоёв…")
     QApplication.processEvents()
     if progress.wasCanceled():
         return AnalysisResult()
 
-    source_layers, missing_src = _resolve_layers(
+    source_layers, missing_src = resolve_layers(
         root, cfg.get("source_layers", []), []
     )
     group_a_cfg = cfg.get("group_a", {})
-    ref_a_layers, missing_a = _resolve_layers(
+    ref_a_layers, missing_a = resolve_layers(
         root,
         group_a_cfg.get("layers", []),
         group_a_cfg.get("groups", []),
     )
     group_b_extra = cfg.get("group_b_extra", {})
-    ref_b_extra, missing_b = _resolve_layers(
+    ref_b_extra, missing_b = resolve_layers(
         root,
         group_b_extra.get("layers", []),
         group_b_extra.get("groups", []),
@@ -533,13 +544,13 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
     if progress.wasCanceled():
         return AnalysisResult()
 
-    log_info("Первичный анализ фото: сбор исходных точек…")
-    source_points = _collect_source_points(source_layers, metric_crs)
+    log_info(f"Первичный анализ фото: сбор исходных точек (район «{district.name}»)…")
+    source_points = _collect_source_points(source_layers, metric_crs, district)
     if not source_points:
         QMessageBox.information(
             parent or iface.mainWindow(),
             "Monitor DB Loader — первичный анализ",
-            "В исходных слоях нет точек для анализа.",
+            f"В районе «{district.name}» нет исходных точек для анализа.",
         )
         progress.close()
         return AnalysisResult()
@@ -552,9 +563,9 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
 
     index_a = ReferenceIndex(metric_crs)
     for lyr in ref_a_layers:
-        cnt = index_a.add_layer(lyr)
+        cnt = index_a.add_layer(lyr, district)
         log_info(f"  Группа А «{lyr.name()}»: {cnt} объектов")
-    log_info(f"Индекс Группы А: {index_a.count} объектов")
+    log_info(f"Индекс Группы А: {index_a.count} объектов (район «{district.name}»)")
 
     progress.setValue(3)
     progress.setLabelText("Классификация (зелёная / жёлтая)…")
@@ -571,20 +582,20 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
 
     index_b = ReferenceIndex(metric_crs)
     for lyr in ref_b_layers:
-        cnt = index_b.add_layer(lyr)
+        cnt = index_b.add_layer(lyr, district)
         log_info(f"  Группа Б «{lyr.name()}»: {cnt} объектов")
-    log_info(f"Индекс Группы Б: {index_b.count} объектов")
+    log_info(f"Индекс Группы Б: {index_b.count} объектов (район «{district.name}»)")
 
     green: List[ClassifiedPoint] = []
     yellow: List[ClassifiedPoint] = []
     red: List[ClassifiedPoint] = []
 
     for sp in source_points:
-        matches_a = index_a.find_matches(sp.metric_geom, radius_green)
+        matches_a = index_a.find_matches_for_source(sp, radius_green)
         if matches_a:
             green.append(ClassifiedPoint(sp, "green", matches_a))
         else:
-            matches_b = index_b.find_matches(sp.metric_geom, radius_yellow)
+            matches_b = index_b.find_matches_for_source(sp, radius_yellow)
             if matches_b:
                 yellow.append(ClassifiedPoint(sp, "yellow", matches_b))
             else:
@@ -667,13 +678,14 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
     QMessageBox.information(
         parent or iface.mainWindow(),
         "Monitor DB Loader — первичный анализ",
-        f"Анализ завершён ({analysis.total} точек):\n"
+        f"Анализ завершён — район «{district.name}» ({analysis.total} точек):\n"
         f"• Зелёная таблица: {analysis.green}\n"
         f"• Жёлтая таблица: {analysis.yellow}\n"
         f"• Красная таблица: {analysis.red}",
     )
     log_info(
-        f"Первичный анализ завершён: {analysis.green}/{analysis.yellow}/"
+        f"Первичный анализ завершён ({district.name}): "
+        f"{analysis.green}/{analysis.yellow}/"
         f"{analysis.red} из {analysis.total}"
     )
     return analysis

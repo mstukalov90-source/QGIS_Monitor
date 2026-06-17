@@ -72,6 +72,39 @@ def dialog_exec(dialog) -> int:
     return dialog.exec_()
 
 
+def show_modeless_dialog(dialog) -> None:
+    """Показать диалог без блокировки остального интерфейса QGIS."""
+    dialog.setModal(False)
+    if IS_QT6:
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        window_flag = Qt.WindowType.Window
+    else:
+        dialog.setWindowModality(Qt.NonModal)  # type: ignore[attr-defined]
+        window_flag = Qt.Window  # type: ignore[attr-defined]
+    flags = dialog.windowFlags()
+    dialog.setWindowFlags(flags | window_flag)
+    QDialog.show(dialog)
+    dialog.raise_()
+    dialog.activateWindow()
+
+
+def register_modeless_dialog(iface, dialog) -> None:
+    """Держать ссылку на немодальный диалог, чтобы его не собрал GC."""
+    if iface is None:
+        return
+    dialogs = getattr(iface, "_monitor_db_loader_task_dialogs", None)
+    if dialogs is None:
+        dialogs = []
+        iface._monitor_db_loader_task_dialogs = dialogs
+    dialogs.append(dialog)
+
+    def _unregister(_obj=None) -> None:
+        if dialog in dialogs:
+            dialogs.remove(dialog)
+
+    dialog.destroyed.connect(_unregister)
+
+
 def qgs_field(name: str, field_type: int):
     """QgsField без DeprecationWarning (QGIS 3.38+: setMetaType вместо конструктора)."""
     from qgis.core import QgsField

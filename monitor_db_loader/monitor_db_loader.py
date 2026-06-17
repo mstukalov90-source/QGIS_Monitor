@@ -18,6 +18,7 @@ from .core.db import DatabaseConnection
 from .core.layer_loader import LayerLoader
 from .core.layer_utils import refresh_map_canvas, zoom_map_to_layers
 from .core.log_util import log_info
+from .core.crm_tasks import run_get_task
 from .core.photo_primary_analysis import run_primary_analysis
 from .core.qt_compat import MSGBOX_CANCEL, MSGBOX_RETRY
 from .ui.password_dialog import PasswordDialog
@@ -31,6 +32,7 @@ class MonitorDbLoader:
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.action = None
         self.analysis_action = None
+        self.task_action = None
         self._config = None
         self._loaded_layer_ids = []
         self._loaded_group_names = []
@@ -51,6 +53,13 @@ class MonitorDbLoader:
         self.iface.addPluginToMenu("&Monitor DB Loader", self.analysis_action)
         self.iface.addToolBarIcon(self.analysis_action)
 
+        self.task_action = QAction(
+            icon, "Получить задачу", self.iface.mainWindow()
+        )
+        self.task_action.triggered.connect(self.run_get_task)
+        self.iface.addPluginToMenu("&Monitor DB Loader", self.task_action)
+        self.iface.addToolBarIcon(self.task_action)
+
         try:
             self._config = load_config()
         except Exception as exc:
@@ -65,6 +74,10 @@ class MonitorDbLoader:
             QTimer.singleShot(500, self.run)
 
     def unload(self):
+        if self.task_action:
+            self.iface.removePluginMenu("&Monitor DB Loader", self.task_action)
+            self.iface.removeToolBarIcon(self.task_action)
+            del self.task_action
         if self.analysis_action:
             self.iface.removePluginMenu("&Monitor DB Loader", self.analysis_action)
             self.iface.removeToolBarIcon(self.analysis_action)
@@ -88,6 +101,21 @@ class MonitorDbLoader:
 
         log_info("Запуск первичного анализа фото…")
         run_primary_analysis(self._config, self.iface, self.iface.mainWindow())
+
+    def run_get_task(self):
+        if self._config is None:
+            try:
+                self._config = load_config()
+            except Exception as exc:
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Monitor DB Loader",
+                    f"Не удалось загрузить конфигурацию:\n{exc}",
+                )
+                return
+
+        log_info("Запуск «Получить задачу»…")
+        run_get_task(self._config, self.iface, self.iface.mainWindow())
 
     def run(self):
         if self._config is None:
