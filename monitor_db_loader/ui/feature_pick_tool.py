@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Инструмент выбора объекта на карте для заполнения полей crm.tasks."""
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from qgis.core import QgsFeature, QgsVectorLayer
 from qgis.gui import QgsHighlight, QgsMapTool, QgsMapToolIdentify
@@ -22,6 +22,8 @@ class FeaturePickMapTool(QgsMapTool):
         self._allowed_layers: List[QgsVectorLayer] = []
         self._source_field = ""
         self._subgroup_label = ""
+        self._layer_field_map: Dict[str, str] = {}
+        self._layer_labels: Dict[str, str] = {}
         self._identify = QgsMapToolIdentify(canvas)
         self._highlight: Optional[QgsHighlight] = None
 
@@ -34,6 +36,21 @@ class FeaturePickMapTool(QgsMapTool):
         self._allowed_layers = layers
         self._source_field = source_field
         self._subgroup_label = subgroup_label
+        self._layer_field_map = {}
+        self._layer_labels = {}
+
+    def set_multi_target(
+        self,
+        layers: List[QgsVectorLayer],
+        layer_field_map: Dict[str, str],
+        layer_labels: Dict[str, str],
+        subgroup_label: str,
+    ) -> None:
+        self._allowed_layers = layers
+        self._layer_field_map = layer_field_map
+        self._layer_labels = layer_labels
+        self._subgroup_label = subgroup_label
+        self._source_field = ""
 
     def activate(self) -> None:
         self.canvas().setCursor(QCursor(Qt.CrossCursor))
@@ -67,17 +84,21 @@ class FeaturePickMapTool(QgsMapTool):
             if not feat or not feat.isValid():
                 continue
 
-            field_idx = layer.fields().indexOf(self._source_field)
+            source_field = self._layer_field_map.get(layer.id(), self._source_field)
+            if not source_field:
+                continue
+
+            field_idx = layer.fields().indexOf(source_field)
             if field_idx < 0:
                 self.pickFailed.emit(
-                    f"В слое «{layer.name()}» нет поля «{self._source_field}»."
+                    f"В слое «{layer.name()}» нет поля «{source_field}»."
                 )
                 return
 
             value = _normalize_id_value(feat.attribute(field_idx))
             if value is None:
                 self.pickFailed.emit(
-                    f"Поле «{self._source_field}» пустое у выбранного объекта."
+                    f"Поле «{source_field}» пустое у выбранного объекта."
                 )
                 return
 

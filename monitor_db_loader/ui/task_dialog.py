@@ -15,9 +15,12 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -25,12 +28,12 @@ from qgis.PyQt.QtWidgets import (
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
-    QMessageBox,
 )
 
 from ..core.config import crm_task_store
 from ..core.crm_task_store import fetch_task_for_feature
 from ..core.crm_tasks import TaskFeature, TaskResult, TaskSubgroup, _connect_with_password
+from ..core.task_dxf_export import export_tasks_to_dxf
 from ..core.db import DatabaseConnection
 from ..core.layer_utils import refresh_map_canvas
 from ..core.qt_compat import BTN_OK, TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
@@ -125,6 +128,12 @@ class TaskDialog(QDialog):
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._on_execute_task)
         action_row.addWidget(self.execute_btn)
+
+        self.export_dxf_btn = QPushButton("Экспорт задач в DXF")
+        self.export_dxf_btn.setEnabled(self._result.total_count > 0)
+        self.export_dxf_btn.clicked.connect(self._on_export_dxf)
+        action_row.addWidget(self.export_dxf_btn)
+
         action_row.addStretch()
         layout.addLayout(action_row)
 
@@ -340,7 +349,72 @@ class TaskDialog(QDialog):
             None,
             iface=self._iface,
             config=self._config,
+            subgroup_name=self._current_subgroup.name,
+            group_name=self._current_group_name,
             on_finished=_on_edit_closed,
+        )
+
+    def _on_export_dxf(self) -> None:
+        if self._result.total_count == 0:
+            QMessageBox.warning(
+                self,
+                "Monitor DB Loader — задачи",
+                "Нет объектов для экспорта.",
+            )
+            return
+
+        if not self._config:
+            QMessageBox.warning(
+                self,
+                "Monitor DB Loader — задачи",
+                "Конфигурация плагина не найдена.",
+            )
+            return
+
+        default_name = f"tasks_{self._result.district_name or 'export'}.dxf"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт задач в DXF",
+            default_name,
+            "DXF files (*.dxf)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".dxf"):
+            path += ".dxf"
+
+        progress = QProgressDialog(
+            "Экспорт задач в DXF…",
+            "Отмена",
+            0,
+            max(self._result.total_count, 1),
+            self,
+        )
+        progress.setWindowTitle("Monitor DB Loader")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        stats = export_tasks_to_dxf(path, self._result, self._config)
+        progress.setValue(self._result.total_count)
+
+        if stats.errors:
+            QMessageBox.critical(
+                self,
+                "Monitor DB Loader — задачи",
+                "Не удалось экспортировать задачи в DXF:\n"
+                + "\n".join(stats.errors),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Monitor DB Loader — задачи",
+            f"Экспорт завершён.\n\n"
+            f"Файл: {path}\n"
+            f"Объектов: {stats.exported}\n"
+            f"Слоёв DXF: {stats.layers_written}\n"
+            f"Пропущено (пустая геометрия): {stats.skipped_empty}\n"
+            f"Пропущено (ошибка): {stats.skipped_invalid}",
         )
 
     def _ensure_layer_visible(self, layer) -> None:

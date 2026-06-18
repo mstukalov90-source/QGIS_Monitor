@@ -19,6 +19,21 @@ class PickTarget:
     missing: List[str] = field(default_factory=list)
 
 
+@dataclass
+class LayerPickInfo:
+    task_column: str
+    source_field: str
+    subgroup_name: str
+
+
+@dataclass
+class LinkPickBundle:
+    layers: List[QgsVectorLayer] = field(default_factory=list)
+    layer_info: Dict[str, LayerPickInfo] = field(default_factory=dict)
+    missing: List[str] = field(default_factory=list)
+    subgroup_names: List[str] = field(default_factory=list)
+
+
 def _subgroup_name_for_column(
     store_cfg: Dict[str, Any], task_column: str
 ) -> Optional[str]:
@@ -75,4 +90,49 @@ def resolve_pick_target(
         source_field=source_field,
         layers=layers,
         missing=missing,
+    )
+
+
+def resolve_link_pick_bundle(
+    config: Dict[str, Any],
+    link_columns: List[str],
+    root=None,
+) -> Optional[LinkPickBundle]:
+    """Слои и маппинг layer_id → столбец для выбора сопоставления с карты."""
+    if not link_columns:
+        return None
+
+    all_layers: List[QgsVectorLayer] = []
+    layer_info: Dict[str, LayerPickInfo] = {}
+    missing: List[str] = []
+    subgroup_names: List[str] = []
+    seen_layer_ids: set = set()
+
+    for task_column in link_columns:
+        target = resolve_pick_target(config, task_column, root=root)
+        if target is None:
+            continue
+        if target.subgroup_name not in subgroup_names:
+            subgroup_names.append(target.subgroup_name)
+        missing.extend(target.missing)
+        for layer in target.layers:
+            layer_id = layer.id()
+            if layer_id in seen_layer_ids:
+                continue
+            seen_layer_ids.add(layer_id)
+            all_layers.append(layer)
+            layer_info[layer_id] = LayerPickInfo(
+                task_column=target.task_column,
+                source_field=target.source_field,
+                subgroup_name=target.subgroup_name,
+            )
+
+    if not all_layers:
+        return LinkPickBundle(layers=[], layer_info={}, missing=missing)
+
+    return LinkPickBundle(
+        layers=all_layers,
+        layer_info=layer_info,
+        missing=missing,
+        subgroup_names=subgroup_names,
     )

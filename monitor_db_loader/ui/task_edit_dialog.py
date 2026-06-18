@@ -16,15 +16,15 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..core.crm_pick import resolve_pick_target
+from ..core.crm_pick import LinkPickBundle, resolve_link_pick_bundle
 from ..core.crm_task_store import (
+    STATION_COLUMNS,
     TASK_COLUMN_LABELS,
-    TASK_FORM_FIELDS,
-    TASK_ID_COLUMNS,
     TaskRecord,
     send_task_to_done_illegal,
     send_task_to_done_legal,
     send_task_to_field,
+    task_form_field_groups,
     update_task_record,
 )
 from ..core.db import DatabaseConnection
@@ -42,6 +42,8 @@ class TaskEditDialog(QDialog):
         *,
         iface=None,
         config: Optional[dict] = None,
+        subgroup_name: Optional[str] = None,
+        group_name: Optional[str] = None,
     ):
         super().__init__(parent)
         self._record = record
@@ -49,16 +51,22 @@ class TaskEditDialog(QDialog):
         self._store_cfg = store_cfg
         self._iface = iface
         self._config = config
+        self._subgroup_name = subgroup_name
+        self._group_name = group_name or record.type
+        self._readonly_fields, self._link_fields = task_form_field_groups(
+            self._group_name, subgroup_name, store_cfg, record
+        )
+        self._form_fields = self._readonly_fields + self._link_fields + list(STATION_COLUMNS)
         self._fields: Dict[str, QLineEdit] = {}
-        self._pick_buttons: Dict[str, QPushButton] = {}
         self._pick_tool: Optional[FeaturePickMapTool] = None
-        self._active_pick_column: Optional[str] = None
+        self._pick_bundle: Optional[LinkPickBundle] = None
+        self._picking = False
         self._action_buttons: List[QPushButton] = []
 
         self.setWindowTitle("Исполнить задачу")
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
-        self.resize(680, 460)
+        self.resize(520, 500)
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -76,23 +84,33 @@ class TaskEditDialog(QDialog):
         key_edit.setReadOnly(True)
         form.addRow(TASK_COLUMN_LABELS["key"], key_edit)
 
-        for field_name in TASK_FORM_FIELDS:
-            edit = QLineEdit(getattr(record, field_name) or "")
-            self._fields[field_name] = edit
-            if field_name in TASK_ID_COLUMNS:
-                row = QHBoxLayout()
-                row.addWidget(edit, stretch=1)
-                pick_btn = QPushButton("Карта")
-                pick_btn.clicked.connect(
-                    lambda checked=False, col=field_name: self._start_pick(col)
-                )
-                self._pick_buttons[field_name] = pick_btn
-                row.addWidget(pick_btn)
-                form.addRow(TASK_COLUMN_LABELS.get(field_name, field_name), row)
-            else:
+        if self._readonly_fields:
+            form.addRow(QLabel("<b>Источник</b>"))
+            for field_name in self._readonly_fields:
+                edit = QLineEdit(getattr(record, field_name) or "")
+                edit.setReadOnly(True)
+                self._fields[field_name] = edit
                 form.addRow(TASK_COLUMN_LABELS.get(field_name, field_name), edit)
 
+        if self._link_fields:
+            form.addRow(QLabel("<b>Сопоставление</b>"))
+            for field_name in self._link_fields:
+                edit = QLineEdit(getattr(record, field_name) or "")
+                self._fields[field_name] = edit
+                form.addRow(TASK_COLUMN_LABELS.get(field_name, field_name), edit)
+
+        form.addRow(QLabel("<b>Данные из Станции</b>"))
+        for field_name in STATION_COLUMNS:
+            edit = QLineEdit(getattr(record, field_name) or "")
+            self._fields[field_name] = edit
+            form.addRow(TASK_COLUMN_LABELS[field_name], edit)
+
         layout.addLayout(form)
+
+        self._pick_map_btn = QPushButton("Указать на карте")
+        self._pick_map_btn.setEnabled(bool(self._link_fields))
+        self._pick_map_btn.clicked.connect(self._toggle_link_pick)
+        layout.addWidget(self._pick_map_btn)
 
         self._cancel_pick_btn = QPushButton("Отмена выбора на карте")
         self._cancel_pick_btn.hide()
@@ -128,11 +146,13 @@ class TaskEditDialog(QDialog):
             self._pick_tool.pickFailed.connect(self._on_pick_failed)
         return self._pick_tool
 
-    def _start_pick(self, task_column: str) -> None:
-        if self._active_pick_column == task_column:
+    def _toggle_link_pick(self) -> None:
+        if self._picking:
             self._cancel_pick()
             return
+        self._start_link_pick()
 
+    def _start_link_pick(self) -> None:
         if self._iface is None or self._config is None:
             QMessageBox.warning(
                 self,
@@ -141,25 +161,14 @@ class TaskEditDialog(QDialog):
             )
             return
 
-        if self._active_pick_column:
-            self._cancel_pick(silent=True)
-
-        target = resolve_pick_target(self._config, task_column)
-        if target is None:
+        bundle = resolve_link_pick_bundle(self._config, self._link_fields)
+        if bundle is None or not bundle.layers:
+            missing = ", ".join(bundle.missing) if bundle and bundle.missing else "—"
             QMessageBox.warning(
                 self,
                 "Monitor DB Loader — задачи",
-                f"Не найдена конфигурация для поля «{task_column}».",
-            )
-            return
-
-        if not target.layers:
-            missing = ", ".join(target.missing) if target.missing else "—"
-            QMessageBox.warning(
-                self,
-                "Monitor DB Loader — задачи",
-                f"Слои для «{target.subgroup_name}» не найдены в проекте.\n\n"
-                f"Загрузите слои Monitor DB.\n"
+                "Слои для сопоставления не найдены в проекте.\n\n"
+                "Загрузите слои Monitor DB.\n"
                 f"Не найдено: {missing}",
             )
             return
@@ -168,23 +177,28 @@ class TaskEditDialog(QDialog):
         if tool is None:
             return
 
-        tool.set_target(
-            target.layers,
-            target.source_field,
-            target.subgroup_name,
+        layer_field_map = {
+            layer_id: info.source_field
+            for layer_id, info in bundle.layer_info.items()
+        }
+        subgroup_label = ", ".join(bundle.subgroup_names)
+        tool.set_multi_target(
+            bundle.layers,
+            layer_field_map,
+            {},
+            subgroup_label,
         )
 
-        self._active_pick_column = task_column
+        self._pick_bundle = bundle
+        self._picking = True
         self._pick_status.setText(
-            f"<b>Выбор на карте:</b> {target.subgroup_name} "
-            f"({target.source_field}) — кликните объект на карте"
+            f"<b>Выбор на карте:</b> {subgroup_label} — кликните объект на карте"
         )
         self._pick_status.show()
         self._cancel_pick_btn.show()
+        self._pick_map_btn.setText("Отмена выбора на карте")
         self._buttons.setEnabled(False)
         self._set_action_buttons_enabled(False)
-        for col, btn in self._pick_buttons.items():
-            btn.setEnabled(col == task_column)
 
         canvas = self._iface.mapCanvas()
         canvas.setFocus()
@@ -196,22 +210,25 @@ class TaskEditDialog(QDialog):
             if canvas.mapTool() is self._pick_tool:
                 canvas.unsetMapTool(self._pick_tool)
 
-        self._active_pick_column = None
+        self._picking = False
+        self._pick_bundle = None
         self._pick_status.hide()
         self._cancel_pick_btn.hide()
+        self._pick_map_btn.setText("Указать на карте")
         self._buttons.setEnabled(True)
         self._set_action_buttons_enabled(True)
-        for btn in self._pick_buttons.values():
-            btn.setEnabled(True)
 
     def _on_feature_picked(
         self, value: str, layer_name: str, feat, layer
     ) -> None:
-        column = self._active_pick_column
-        if not column or column not in self._fields:
+        if not self._pick_bundle:
             return
 
-        self._fields[column].setText(value)
+        info = self._pick_bundle.layer_info.get(layer.id())
+        if info is None or info.task_column not in self._fields:
+            return
+
+        self._fields[info.task_column].setText(value)
         self._cancel_pick(silent=True)
         self.raise_()
         self.activateWindow()
@@ -225,16 +242,26 @@ class TaskEditDialog(QDialog):
             btn.setEnabled(enabled)
 
     def _record_from_form(self) -> TaskRecord:
-        return TaskRecord(
-            key=self._record.key,
-            type=self._fields["type"].text().strip(),
-            photo_uuid=self._fields["photo_uuid"].text().strip() or None,
-            photo_lens=self._fields["photo_lens"].text().strip() or None,
-            ogh_id=self._fields["ogh_id"].text().strip() or None,
-            oati_id=self._fields["oati_id"].text().strip() or None,
-            earthwork_id=self._fields["earthwork_id"].text().strip() or None,
-            localwork_id=self._fields["localwork_id"].text().strip() or None,
-            avr_mos_id=self._fields["avr_mos_id"].text().strip() or None,
+        data = self._record.as_dict()
+        for field_name in self._form_fields:
+            if field_name in self._fields:
+                value = self._fields[field_name].text().strip() or None
+                data[field_name] = value
+        return TaskRecord.from_row(
+            (
+                data["key"],
+                data["type"],
+                data["photo_uuid"],
+                data["photo_lens"],
+                data["ogh_id"],
+                data["oati_id"],
+                data["earthwork_id"],
+                data["localwork_id"],
+                data["avr_mos_id"],
+                data["sps"],
+                data["kgs"],
+                data["station_avr"],
+            )
         )
 
     def _on_save(self) -> None:
@@ -334,6 +361,8 @@ class TaskEditDialog(QDialog):
         *,
         iface=None,
         config: Optional[dict] = None,
+        subgroup_name: Optional[str] = None,
+        group_name: Optional[str] = None,
         on_finished: Optional[Callable[[int], None]] = None,
     ) -> "TaskEditDialog":
         dlg = TaskEditDialog(
@@ -343,6 +372,8 @@ class TaskEditDialog(QDialog):
             None,
             iface=iface,
             config=config,
+            subgroup_name=subgroup_name,
+            group_name=group_name,
         )
         if on_finished is not None:
             dlg.finished.connect(on_finished)

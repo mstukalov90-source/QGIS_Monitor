@@ -22,6 +22,21 @@ TASK_ID_COLUMNS = (
     "avr_mos_id",
 )
 
+CRM_GROUP_DISRUPTIONS = "Разрытия"
+CRM_GROUP_ORDERS = "Новые ордера ОАТИ, АВР и земляные работы"
+
+LINK_COLUMNS_BY_GROUP = {
+    CRM_GROUP_DISRUPTIONS: (
+        "oati_id",
+        "earthwork_id",
+        "localwork_id",
+        "avr_mos_id",
+    ),
+    CRM_GROUP_ORDERS: ("photo_uuid", "photo_lens", "ogh_id"),
+}
+
+STATION_COLUMNS = ("sps", "kgs", "station_avr")
+
 TASK_COLUMN_LABELS = {
     "key": "Ключ задачи",
     "type": "Тип",
@@ -32,6 +47,9 @@ TASK_COLUMN_LABELS = {
     "earthwork_id": "Земляные работы (registration_number_notifications)",
     "localwork_id": "Локальные ремонты (global_id)",
     "avr_mos_id": "АВР (em_call_reg_num)",
+    "sps": "СПС",
+    "kgs": "КГС",
+    "station_avr": "АВР",
 }
 
 TASK_FORM_FIELDS = ("type",) + TASK_ID_COLUMNS
@@ -48,7 +66,10 @@ _DDL_STATEMENTS = (
         oati_id TEXT,
         earthwork_id TEXT,
         localwork_id TEXT,
-        avr_mos_id TEXT
+        avr_mos_id TEXT,
+        sps TEXT,
+        kgs TEXT,
+        station_avr TEXT
     )
     """,
     """
@@ -82,6 +103,14 @@ _DDL_STATEMENTS = (
 )
 
 
+def _station_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
+    return tuple(
+        f'ALTER TABLE "{schema}"."{table}" '
+        f'ADD COLUMN IF NOT EXISTS "{col}" TEXT'
+        for col in STATION_COLUMNS
+    )
+
+
 def _snapshot_ddl_statements(
     schema: str, tasks_table: str, snapshot_table: str
 ) -> Tuple[str, ...]:
@@ -100,6 +129,9 @@ def _snapshot_ddl_statements(
             earthwork_id TEXT,
             localwork_id TEXT,
             avr_mos_id TEXT,
+            sps TEXT,
+            kgs TEXT,
+            station_avr TEXT,
             sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
@@ -133,6 +165,9 @@ class TaskRecord:
     earthwork_id: Optional[str] = None
     localwork_id: Optional[str] = None
     avr_mos_id: Optional[str] = None
+    sps: Optional[str] = None
+    kgs: Optional[str] = None
+    station_avr: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -145,6 +180,9 @@ class TaskRecord:
             "earthwork_id": self.earthwork_id,
             "localwork_id": self.localwork_id,
             "avr_mos_id": self.avr_mos_id,
+            "sps": self.sps,
+            "kgs": self.kgs,
+            "station_avr": self.station_avr,
         }
 
     @classmethod
@@ -159,6 +197,9 @@ class TaskRecord:
             earthwork_id=_normalize_id_value(row[6]),
             localwork_id=_normalize_id_value(row[7]),
             avr_mos_id=_normalize_id_value(row[8]),
+            sps=_normalize_id_value(row[9]) if len(row) > 9 else None,
+            kgs=_normalize_id_value(row[10]) if len(row) > 10 else None,
+            station_avr=_normalize_id_value(row[11]) if len(row) > 11 else None,
         )
 
 
@@ -175,9 +216,12 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
         log_warning("psycopg2 недоступен — запись задач в БД невозможна")
         return False
 
+    schema, table = "crm", "tasks"
     try:
         with pg.cursor() as cur:
             for stmt in _DDL_STATEMENTS:
+                cur.execute(stmt)
+            for stmt in _station_migration_statements(schema, table):
                 cur.execute(stmt)
         pg.commit()
         log_info("Таблица crm.tasks проверена/создана")
@@ -292,6 +336,8 @@ def ensure_task_snapshot_table(
         with pg.cursor() as cur:
             for stmt in _snapshot_ddl_statements(schema, tasks_table, snapshot_table):
                 cur.execute(stmt)
+            for stmt in _station_migration_statements(snapshot_schema, snapshot_table):
+                cur.execute(stmt)
         pg.commit()
         log_info(f"Таблица {snapshot_schema}.{snapshot_table} проверена/создана")
         return True
@@ -367,9 +413,11 @@ def send_task_snapshot(
     if not task_type:
         raise ValueError("Поле «type» не может быть пустым")
 
-    columns = ["task_key", "type"] + list(TASK_ID_COLUMNS)
+    columns = ["task_key", "type"] + list(TASK_ID_COLUMNS) + list(STATION_COLUMNS)
     values = [record.key, task_type] + [
         _normalize_id_value(getattr(record, col)) for col in TASK_ID_COLUMNS
+    ] + [
+        _normalize_id_value(getattr(record, col)) for col in STATION_COLUMNS
     ]
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
@@ -436,7 +484,9 @@ def fetch_task(
     if pg is None:
         return None
 
-    columns = ", ".join(f'"{col}"' for col in ("key", "type") + TASK_ID_COLUMNS)
+    columns = ", ".join(
+        f'"{col}"' for col in ("key", "type") + TASK_ID_COLUMNS + STATION_COLUMNS
+    )
     query = (
         f'SELECT {columns} FROM "{schema}"."{table}" '
         f'WHERE "{task_column}" = %s LIMIT 1'
@@ -458,6 +508,41 @@ def fetch_task_for_feature(
         return None
     task_column, business_id = lookup
     return fetch_task(conn, store_cfg, task_column, business_id)
+
+
+def resolve_primary_task_column(
+    subgroup_name: Optional[str],
+    store_cfg: Dict[str, Any],
+    record: Optional[TaskRecord] = None,
+) -> Optional[str]:
+    """Столбец crm.tasks для исходного объекта по имени подгруппы."""
+    if subgroup_name:
+        mapping = store_cfg.get("subgroups", {}).get(subgroup_name)
+        if mapping:
+            task_column = mapping.get("task_column")
+            if task_column in TASK_ID_COLUMNS:
+                return task_column
+
+    if record is not None:
+        for col in TASK_ID_COLUMNS:
+            if getattr(record, col):
+                return col
+    return None
+
+
+def task_form_field_groups(
+    group_name: Optional[str],
+    subgroup_name: Optional[str],
+    store_cfg: Dict[str, Any],
+    record: TaskRecord,
+) -> Tuple[List[str], List[str]]:
+    """Поля формы «Исполнить задачу»: readonly (источник) и link (сопоставление)."""
+    primary = resolve_primary_task_column(subgroup_name, store_cfg, record)
+    readonly: List[str] = ["type"]
+    if primary:
+        readonly.append(primary)
+    link = list(LINK_COLUMNS_BY_GROUP.get(group_name or "", ()))
+    return readonly, link
 
 
 def _duplicate_exists(
@@ -490,13 +575,16 @@ def update_task_record(
     if not task_type:
         raise ValueError("Поле «type» не может быть пустым")
 
-    values = {
+    id_values = {
         col: _normalize_id_value(getattr(record, col)) for col in TASK_ID_COLUMNS
+    }
+    station_values = {
+        col: _normalize_id_value(getattr(record, col)) for col in STATION_COLUMNS
     }
 
     try:
         with pg.cursor() as cur:
-            for column, value in values.items():
+            for column, value in id_values.items():
                 if value is None:
                     continue
                 if _duplicate_exists(cur, schema, table, column, value, record.key):
@@ -505,8 +593,11 @@ def update_task_record(
                         f"Значение «{value}» для «{label}» уже используется в другой задаче"
                     )
 
-            set_parts = ['"type" = %s'] + [f'"{col}" = %s' for col in TASK_ID_COLUMNS]
-            params: List[Any] = [task_type] + [values[col] for col in TASK_ID_COLUMNS]
+            all_columns = list(TASK_ID_COLUMNS) + list(STATION_COLUMNS)
+            set_parts = ['"type" = %s'] + [f'"{col}" = %s' for col in all_columns]
+            params: List[Any] = [task_type] + [
+                id_values[col] for col in TASK_ID_COLUMNS
+            ] + [station_values[col] for col in STATION_COLUMNS]
             params.append(record.key)
             query = (
                 f'UPDATE "{schema}"."{table}" '
