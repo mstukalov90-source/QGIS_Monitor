@@ -1,7 +1,7 @@
 {
   "project": "QGIS Plugin Development",
   "task": "Database connection and layer visualization plugin",
-  "version": "1.12.6",
+  "version": "1.14.0",
   "description": "Plugin for connecting to PostgreSQL database and displaying spatial layers with predefined symbology",
   "database_connection": {
     "host": "77.222.63.161",
@@ -644,6 +644,9 @@
     "task_store": {
       "schema": "crm",
       "table": "tasks",
+      "field_table": "tasks_field",
+      "done_legal_table": "tasks_done_legal",
+      "done_illegal_table": "tasks_done_illegal",
       "subgroups": {
         "Фото после обработки ИИ": {
           "task_column": "photo_uuid",

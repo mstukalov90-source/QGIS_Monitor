@@ -2,7 +2,7 @@
 """Сохранение задач CRM в PostgreSQL (crm.tasks)."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .db import DatabaseConnection
 from .log_util import log_info, log_warning
@@ -80,6 +80,39 @@ _DDL_STATEMENTS = (
         ON crm.tasks (avr_mos_id) WHERE avr_mos_id IS NOT NULL
     """,
 )
+
+
+def _snapshot_ddl_statements(
+    schema: str, tasks_table: str, snapshot_table: str
+) -> Tuple[str, ...]:
+    index_name = f"{snapshot_table}_uq_task_key"
+    return (
+        "CREATE SCHEMA IF NOT EXISTS crm",
+        f"""
+        CREATE TABLE IF NOT EXISTS "{schema}"."{snapshot_table}" (
+            key UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            task_key UUID NOT NULL REFERENCES "{schema}"."{tasks_table}"(key),
+            type TEXT NOT NULL,
+            photo_uuid TEXT,
+            photo_lens TEXT,
+            ogh_id TEXT,
+            oati_id TEXT,
+            earthwork_id TEXT,
+            localwork_id TEXT,
+            avr_mos_id TEXT,
+            sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
+            ON "{schema}"."{snapshot_table}" (task_key)
+        """,
+    )
+
+
+SendTaskSnapshotResult = Literal["inserted", "skipped"]
+# Backward-compatible alias
+SendToFieldResult = SendTaskSnapshotResult
 
 
 @dataclass
@@ -222,6 +255,171 @@ def resolve_task_lookup(
 
 def _table_ref(store_cfg: Dict[str, Any]) -> Tuple[str, str]:
     return store_cfg.get("schema", "crm"), store_cfg.get("table", "tasks")
+
+
+def _snapshot_table_ref(
+    store_cfg: Dict[str, Any], config_key: str, default_table: str
+) -> Tuple[str, str]:
+    schema = store_cfg.get("schema", "crm")
+    table = store_cfg.get(config_key, default_table)
+    return schema, table
+
+
+def _field_table_ref(store_cfg: Dict[str, Any]) -> Tuple[str, str]:
+    return _snapshot_table_ref(store_cfg, "field_table", "tasks_field")
+
+
+def ensure_task_snapshot_table(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    config_key: str,
+    default_table: str,
+) -> bool:
+    """Создать таблицу-снимок задач при отсутствии."""
+    if not ensure_tasks_table(conn):
+        return False
+
+    schema, tasks_table = _table_ref(store_cfg)
+    snapshot_schema, snapshot_table = _snapshot_table_ref(
+        store_cfg, config_key, default_table
+    )
+    pg = _pg_connection(conn)
+    if pg is None:
+        log_warning(f"psycopg2 недоступен — запись в {snapshot_table} невозможна")
+        return False
+
+    try:
+        with pg.cursor() as cur:
+            for stmt in _snapshot_ddl_statements(schema, tasks_table, snapshot_table):
+                cur.execute(stmt)
+        pg.commit()
+        log_info(f"Таблица {snapshot_schema}.{snapshot_table} проверена/создана")
+        return True
+    except Exception as exc:
+        try:
+            pg.rollback()
+        except Exception:
+            pass
+        log_warning(
+            f"Не удалось создать {snapshot_schema}.{snapshot_table}: {exc}"
+        )
+        return False
+
+
+def ensure_tasks_field_table(
+    conn: DatabaseConnection, store_cfg: Dict[str, Any]
+) -> bool:
+    return ensure_task_snapshot_table(
+        conn, store_cfg, "field_table", "tasks_field"
+    )
+
+
+def task_key_exists_in_snapshot(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    config_key: str,
+    default_table: str,
+    task_key: str,
+) -> bool:
+    schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+
+    query = f'SELECT 1 FROM "{schema}"."{table}" WHERE task_key = %s LIMIT 1'
+    with pg.cursor() as cur:
+        cur.execute(query, (task_key,))
+        return cur.fetchone() is not None
+
+
+def task_key_exists_in_field(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    task_key: str,
+) -> bool:
+    return task_key_exists_in_snapshot(
+        conn, store_cfg, "field_table", "tasks_field", task_key
+    )
+
+
+def send_task_snapshot(
+    conn: DatabaseConnection,
+    record: TaskRecord,
+    store_cfg: Dict[str, Any],
+    config_key: str,
+    default_table: str,
+) -> SendTaskSnapshotResult:
+    """Сохранить снимок задачи в таблицу-снимок (без повторов по task_key)."""
+    schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
+    if not ensure_task_snapshot_table(conn, store_cfg, config_key, default_table):
+        raise RuntimeError(f"Не удалось подготовить таблицу {schema}.{table}")
+
+    if task_key_exists_in_snapshot(
+        conn, store_cfg, config_key, default_table, record.key
+    ):
+        return "skipped"
+
+    pg = _pg_connection(conn)
+    if pg is None:
+        raise RuntimeError("psycopg2 недоступен")
+
+    task_type = (record.type or "").strip()
+    if not task_type:
+        raise ValueError("Поле «type» не может быть пустым")
+
+    columns = ["task_key", "type"] + list(TASK_ID_COLUMNS)
+    values = [record.key, task_type] + [
+        _normalize_id_value(getattr(record, col)) for col in TASK_ID_COLUMNS
+    ]
+    placeholders = ", ".join(["%s"] * len(columns))
+    col_list = ", ".join(f'"{col}"' for col in columns)
+    query = (
+        f'INSERT INTO "{schema}"."{table}" ({col_list}) '
+        f"VALUES ({placeholders})"
+    )
+
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, values)
+        pg.commit()
+        log_info(f"crm.{table}: отправлена задача {record.key}")
+        return "inserted"
+    except Exception:
+        try:
+            pg.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def send_task_to_field(
+    conn: DatabaseConnection,
+    record: TaskRecord,
+    store_cfg: Dict[str, Any],
+) -> SendTaskSnapshotResult:
+    return send_task_snapshot(
+        conn, record, store_cfg, "field_table", "tasks_field"
+    )
+
+
+def send_task_to_done_legal(
+    conn: DatabaseConnection,
+    record: TaskRecord,
+    store_cfg: Dict[str, Any],
+) -> SendTaskSnapshotResult:
+    return send_task_snapshot(
+        conn, record, store_cfg, "done_legal_table", "tasks_done_legal"
+    )
+
+
+def send_task_to_done_illegal(
+    conn: DatabaseConnection,
+    record: TaskRecord,
+    store_cfg: Dict[str, Any],
+) -> SendTaskSnapshotResult:
+    return send_task_snapshot(
+        conn, record, store_cfg, "done_illegal_table", "tasks_done_illegal"
+    )
 
 
 def fetch_task(

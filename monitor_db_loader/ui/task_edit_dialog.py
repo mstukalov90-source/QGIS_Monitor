@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Диалог редактирования строки crm.tasks."""
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
@@ -22,6 +22,9 @@ from ..core.crm_task_store import (
     TASK_FORM_FIELDS,
     TASK_ID_COLUMNS,
     TaskRecord,
+    send_task_to_done_illegal,
+    send_task_to_done_legal,
+    send_task_to_field,
     update_task_record,
 )
 from ..core.db import DatabaseConnection
@@ -50,11 +53,12 @@ class TaskEditDialog(QDialog):
         self._pick_buttons: Dict[str, QPushButton] = {}
         self._pick_tool: Optional[FeaturePickMapTool] = None
         self._active_pick_column: Optional[str] = None
+        self._action_buttons: List[QPushButton] = []
 
         self.setWindowTitle("Исполнить задачу")
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
-        self.resize(560, 460)
+        self.resize(680, 460)
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -95,11 +99,24 @@ class TaskEditDialog(QDialog):
         self._cancel_pick_btn.clicked.connect(self._cancel_pick)
         layout.addWidget(self._cancel_pick_btn)
 
+        footer = QHBoxLayout()
+        for label, handler in (
+            ("Отправить задачу в поле", self._on_send_to_field),
+            ("Закрыть легальное", self._on_close_legal),
+            ("Закрыть нелегальное", self._on_close_illegal),
+        ):
+            btn = QPushButton(label)
+            btn.clicked.connect(handler)
+            self._action_buttons.append(btn)
+            footer.addWidget(btn)
+        footer.addStretch()
+
         self._buttons = QDialogButtonBox(BTN_OK | BTN_CANCEL)
         self._buttons.button(BTN_OK).setText("Сохранить")
         self._buttons.accepted.connect(self._on_save)
         self._buttons.rejected.connect(self.reject)
-        layout.addWidget(self._buttons)
+        footer.addWidget(self._buttons)
+        layout.addLayout(footer)
 
     def _ensure_pick_tool(self) -> Optional[FeaturePickMapTool]:
         if self._iface is None:
@@ -165,6 +182,7 @@ class TaskEditDialog(QDialog):
         self._pick_status.show()
         self._cancel_pick_btn.show()
         self._buttons.setEnabled(False)
+        self._set_action_buttons_enabled(False)
         for col, btn in self._pick_buttons.items():
             btn.setEnabled(col == task_column)
 
@@ -182,6 +200,7 @@ class TaskEditDialog(QDialog):
         self._pick_status.hide()
         self._cancel_pick_btn.hide()
         self._buttons.setEnabled(True)
+        self._set_action_buttons_enabled(True)
         for btn in self._pick_buttons.values():
             btn.setEnabled(True)
 
@@ -201,10 +220,12 @@ class TaskEditDialog(QDialog):
         parent = self._iface.mainWindow() if self._iface else self
         QMessageBox.warning(parent, "Monitor DB Loader — задачи", message)
 
-    def _on_save(self) -> None:
-        self._cancel_pick(silent=True)
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        for btn in self._action_buttons:
+            btn.setEnabled(enabled)
 
-        updated = TaskRecord(
+    def _record_from_form(self) -> TaskRecord:
+        return TaskRecord(
             key=self._record.key,
             type=self._fields["type"].text().strip(),
             photo_uuid=self._fields["photo_uuid"].text().strip() or None,
@@ -215,6 +236,11 @@ class TaskEditDialog(QDialog):
             localwork_id=self._fields["localwork_id"].text().strip() or None,
             avr_mos_id=self._fields["avr_mos_id"].text().strip() or None,
         )
+
+    def _on_save(self) -> None:
+        self._cancel_pick(silent=True)
+
+        updated = self._record_from_form()
 
         try:
             update_task_record(self._conn, updated, self._store_cfg)
@@ -231,6 +257,61 @@ class TaskEditDialog(QDialog):
 
         self._record = updated
         self.accept()
+
+    def _send_task_snapshot(
+        self,
+        send_fn: Callable,
+        success_message: str,
+        skipped_message: str,
+        error_prefix: str,
+    ) -> None:
+        self._cancel_pick(silent=True)
+        updated = self._record_from_form()
+
+        try:
+            update_task_record(self._conn, updated, self._store_cfg)
+            result = send_fn(self._conn, updated, self._store_cfg)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Monitor DB Loader — задачи", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Monitor DB Loader — задачи",
+                f"{error_prefix}:\n{exc}",
+            )
+            return
+
+        self._record = updated
+        QMessageBox.information(
+            self,
+            "Monitor DB Loader — задачи",
+            skipped_message if result == "skipped" else success_message,
+        )
+
+    def _on_send_to_field(self) -> None:
+        self._send_task_snapshot(
+            send_task_to_field,
+            "Задача отправлена в поле.",
+            "Задача уже была отправлена в поле.",
+            "Не удалось отправить задачу в поле",
+        )
+
+    def _on_close_legal(self) -> None:
+        self._send_task_snapshot(
+            send_task_to_done_legal,
+            "Задача закрыта как легальная.",
+            "Задача уже была закрыта как легальная.",
+            "Не удалось закрыть задачу как легальную",
+        )
+
+    def _on_close_illegal(self) -> None:
+        self._send_task_snapshot(
+            send_task_to_done_illegal,
+            "Задача закрыта как нелегальная.",
+            "Задача уже была закрыта как нелегальная.",
+            "Не удалось закрыть задачу как нелегальную",
+        )
 
     def reject(self) -> None:
         self._cancel_pick(silent=True)
