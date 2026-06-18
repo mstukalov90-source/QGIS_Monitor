@@ -31,9 +31,12 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..core.config import crm_task_store
-from ..core.crm_task_store import fetch_task_for_feature
+from ..core.crm_task_store import (
+    fetch_task_for_feature,
+    filter_sent_tasks_from_result,
+)
 from ..core.crm_tasks import TaskFeature, TaskResult, TaskSubgroup, _connect_with_password
-from ..core.task_dxf_export import export_tasks_to_dxf
+from ..core.task_dxf_export import export_tasks_to_dxf, export_tasks_to_shp
 from ..core.db import DatabaseConnection
 from ..core.layer_utils import refresh_map_canvas
 from ..core.qt_compat import BTN_OK, TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
@@ -118,9 +121,7 @@ class TaskDialog(QDialog):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
 
-        self._populate_tree()
-
-        self.status_label = QLabel(self._status_text())
+        self.status_label = QLabel("")
         layout.addWidget(self.status_label)
 
         action_row = QHBoxLayout()
@@ -130,9 +131,12 @@ class TaskDialog(QDialog):
         action_row.addWidget(self.execute_btn)
 
         self.export_dxf_btn = QPushButton("Экспорт задач в DXF")
-        self.export_dxf_btn.setEnabled(self._result.total_count > 0)
         self.export_dxf_btn.clicked.connect(self._on_export_dxf)
         action_row.addWidget(self.export_dxf_btn)
+
+        self.export_shp_btn = QPushButton("Экспорт задач в SHP")
+        self.export_shp_btn.clicked.connect(self._on_export_shp)
+        action_row.addWidget(self.export_shp_btn)
 
         action_row.addStretch()
         layout.addLayout(action_row)
@@ -142,12 +146,46 @@ class TaskDialog(QDialog):
         buttons.accepted.connect(self.close)
         layout.addWidget(buttons)
 
+        if self._db_conn and self._store_cfg:
+            self._apply_snapshot_filter()
+        else:
+            self._populate_tree()
+            self.status_label.setText(self._status_text())
+            self._update_action_buttons()
+
         first_subgroup = self._first_subgroup_item()
         if first_subgroup:
             self.tree.setCurrentItem(first_subgroup)
 
     def _status_text(self) -> str:
-        return f"Всего объектов в районе: {self._result.total_count}"
+        return f"Активных задач в районе: {self._result.total_count}"
+
+    def _update_action_buttons(self) -> None:
+        enabled = self._result.total_count > 0
+        self.export_dxf_btn.setEnabled(enabled)
+        self.export_shp_btn.setEnabled(enabled)
+
+    def _apply_snapshot_filter(self) -> None:
+        if not self._db_conn or not self._store_cfg:
+            return
+
+        filter_sent_tasks_from_result(
+            self._result, self._db_conn, self._store_cfg
+        )
+        self._populate_tree()
+        self._clear_row_selection()
+
+        if self._current_subgroup and self._current_subgroup.features:
+            self._fill_table(self._current_subgroup)
+        else:
+            first_subgroup = self._first_subgroup_item()
+            if first_subgroup:
+                self.tree.setCurrentItem(first_subgroup)
+            else:
+                self._fill_table(None)
+
+        self.status_label.setText(self._status_text())
+        self._update_action_buttons()
 
     def _populate_tree(self) -> None:
         self.tree.clear()
@@ -341,6 +379,7 @@ class TaskDialog(QDialog):
         def _on_edit_closed(_result: int) -> None:
             if own_conn:
                 conn.close()
+            self._apply_snapshot_filter()
 
         TaskEditDialog.open_edit(
             record,
@@ -410,11 +449,74 @@ class TaskDialog(QDialog):
             self,
             "Monitor DB Loader — задачи",
             f"Экспорт завершён.\n\n"
-            f"Файл: {path}\n"
+            f"DXF: {path}\n"
+            f"ID (CSV): {stats.csv_path}\n"
             f"Объектов: {stats.exported}\n"
-            f"Слоёв DXF: {stats.layers_written}\n"
             f"Пропущено (пустая геометрия): {stats.skipped_empty}\n"
-            f"Пропущено (ошибка): {stats.skipped_invalid}",
+            f"Пропущено (без ID / ошибка): {stats.skipped_invalid}",
+        )
+
+    def _on_export_shp(self) -> None:
+        if self._result.total_count == 0:
+            QMessageBox.warning(
+                self,
+                "Monitor DB Loader — задачи",
+                "Нет объектов для экспорта.",
+            )
+            return
+
+        if not self._config:
+            QMessageBox.warning(
+                self,
+                "Monitor DB Loader — задачи",
+                "Конфигурация плагина не найдена.",
+            )
+            return
+
+        default_name = f"tasks_{self._result.district_name or 'export'}.shp"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт задач в SHP",
+            default_name,
+            "Shapefile (*.shp)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".shp"):
+            path += ".shp"
+
+        progress = QProgressDialog(
+            "Экспорт задач в SHP…",
+            "Отмена",
+            0,
+            max(self._result.total_count, 1),
+            self,
+        )
+        progress.setWindowTitle("Monitor DB Loader")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        stats = export_tasks_to_shp(path, self._result, self._config)
+        progress.setValue(self._result.total_count)
+
+        if stats.errors:
+            QMessageBox.critical(
+                self,
+                "Monitor DB Loader — задачи",
+                "Не удалось экспортировать задачи в SHP:\n"
+                + "\n".join(stats.errors),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Monitor DB Loader — задачи",
+            f"Экспорт завершён.\n\n"
+            f"SHP: {path}\n"
+            f"Объектов: {stats.exported}\n"
+            f"Поля: group, subgroup, task_col, id\n"
+            f"Пропущено (пустая геометрия): {stats.skipped_empty}\n"
+            f"Пропущено (без ID / ошибка): {stats.skipped_invalid}",
         )
 
     def _ensure_layer_visible(self, layer) -> None:

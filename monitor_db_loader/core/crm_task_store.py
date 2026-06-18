@@ -2,7 +2,7 @@
 """Сохранение задач CRM в PostgreSQL (crm.tasks)."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from .db import DatabaseConnection
 from .log_util import log_info, log_warning
@@ -386,6 +386,97 @@ def task_key_exists_in_field(
     return task_key_exists_in_snapshot(
         conn, store_cfg, "field_table", "tasks_field", task_key
     )
+
+
+_SNAPSHOT_TABLES = (
+    ("field_table", "tasks_field"),
+    ("done_legal_table", "tasks_done_legal"),
+    ("done_illegal_table", "tasks_done_illegal"),
+)
+
+
+def fetch_snapshot_task_keys(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> Set[str]:
+    """Все task_key из tasks_field, tasks_done_legal, tasks_done_illegal."""
+    keys: Set[str] = set()
+    pg = _pg_connection(conn)
+    if pg is None:
+        return keys
+
+    for config_key, default_table in _SNAPSHOT_TABLES:
+        schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
+        query = f'SELECT task_key FROM "{schema}"."{table}"'
+        try:
+            with pg.cursor() as cur:
+                cur.execute(query)
+                for row in cur.fetchall():
+                    if row[0]:
+                        keys.add(str(row[0]))
+        except Exception:
+            continue
+    return keys
+
+
+def fetch_task_keys_index(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> Dict[Tuple[str, str], str]:
+    """Соответствие (task_column, business_id) → key в crm.tasks."""
+    schema, table = _table_ref(store_cfg)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return {}
+
+    col_list = ", ".join(f'"{col}"' for col in ("key",) + TASK_ID_COLUMNS)
+    query = f'SELECT {col_list} FROM "{schema}"."{table}"'
+    index: Dict[Tuple[str, str], str] = {}
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query)
+            for row in cur.fetchall():
+                key = str(row[0])
+                for col_index, col in enumerate(TASK_ID_COLUMNS, start=1):
+                    value = _normalize_id_value(row[col_index])
+                    if value:
+                        index[(col, value)] = key
+    except Exception as exc:
+        log_warning(f"Не удалось загрузить индекс crm.tasks: {exc}")
+    return index
+
+
+def filter_sent_tasks_from_result(
+    task_result,
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> int:
+    """Скрыть задачи, уже отправленные в field/done_* таблицы. Возвращает число скрытых."""
+    snapshot_keys = fetch_snapshot_task_keys(conn, store_cfg)
+    if not snapshot_keys:
+        return 0
+
+    task_index = fetch_task_keys_index(conn, store_cfg)
+    hidden = 0
+
+    for group in task_result.groups:
+        for subgroup in group.subgroups:
+            kept = []
+            for feat in subgroup.features:
+                lookup = resolve_task_lookup(
+                    subgroup.name, feat.attributes, store_cfg
+                )
+                if lookup:
+                    task_key = task_index.get(lookup)
+                    if task_key and task_key in snapshot_keys:
+                        hidden += 1
+                        continue
+                kept.append(feat)
+            subgroup.features = kept
+
+    if hidden:
+        log_info(f"crm.tasks: скрыто из списка {hidden} отправленных задач")
+    return hidden
 
 
 def send_task_snapshot(
