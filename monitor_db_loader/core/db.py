@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """PostgreSQL connection helpers and layer URI building."""
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from qgis.core import QgsDataSourceUri, QgsVectorLayer
 
@@ -32,6 +32,7 @@ class DatabaseConnection:
         self._geom_cache: Dict[Tuple[str, str, str], Optional[str]] = {}
         self._pg_conn = None
         self._mixed_loader = MixedGeometryLoader(self)
+        self._crm_schema_ready: Set[str] = set()
 
     def close(self):
         if self._pg_conn is not None:
@@ -40,19 +41,24 @@ class DatabaseConnection:
             except Exception:
                 pass
             self._pg_conn = None
+        self._crm_schema_ready.clear()
+
+    def _pg_connect_kwargs(self) -> Dict[str, Any]:
+        return {
+            "host": self.host,
+            "port": int(self.port),
+            "dbname": self.database,
+            "user": self.username,
+            "password": self.password,
+            "connect_timeout": 15,
+            "options": "-c statement_timeout=30000",
+        }
 
     def _get_pg_connection(self):
         if psycopg2 is None:
             return None
         if self._pg_conn is None or self._pg_conn.closed:
-            self._pg_conn = psycopg2.connect(
-                host=self.host,
-                port=int(self.port),
-                dbname=self.database,
-                user=self.username,
-                password=self.password,
-                connect_timeout=15,
-            )
+            self._pg_conn = psycopg2.connect(**self._pg_connect_kwargs())
         return self._pg_conn
 
     def test_connection(self) -> Tuple[bool, str]:
@@ -62,14 +68,7 @@ class DatabaseConnection:
         )
         if psycopg2 is not None:
             try:
-                conn = psycopg2.connect(
-                    host=self.host,
-                    port=int(self.port),
-                    dbname=self.database,
-                    user=self.username,
-                    password=self.password,
-                    connect_timeout=15,
-                )
+                conn = psycopg2.connect(**self._pg_connect_kwargs())
                 conn.close()
                 log_info("Подключение к БД успешно (psycopg2).")
                 return True, ""

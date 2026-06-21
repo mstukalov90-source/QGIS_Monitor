@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -24,6 +25,8 @@ from ..core.crm_task_store import (
     send_task_to_done_illegal,
     send_task_to_done_legal,
     send_task_to_field,
+    send_task_to_clear,
+    ensure_all_snapshot_tables,
     task_form_field_groups,
     update_task_record,
 )
@@ -62,6 +65,12 @@ class TaskEditDialog(QDialog):
         self._pick_bundle: Optional[LinkPickBundle] = None
         self._picking = False
         self._action_buttons: List[QPushButton] = []
+
+        if self._conn and self._store_cfg:
+            try:
+                ensure_all_snapshot_tables(self._conn, self._store_cfg)
+            except Exception:
+                pass
 
         self.setWindowTitle("Исполнить задачу")
         self.setModal(False)
@@ -122,6 +131,7 @@ class TaskEditDialog(QDialog):
             ("Отправить задачу в поле", self._on_send_to_field),
             ("Закрыть легальное", self._on_close_legal),
             ("Закрыть нелегальное", self._on_close_illegal),
+            ("Разрытие отсутствует", self._on_disruption_absent),
         ):
             btn = QPushButton(label)
             btn.clicked.connect(handler)
@@ -241,6 +251,15 @@ class TaskEditDialog(QDialog):
         for btn in self._action_buttons:
             btn.setEnabled(enabled)
 
+    def _set_busy(self, busy: bool) -> None:
+        self._set_action_buttons_enabled(not busy)
+        self._buttons.setEnabled(not busy)
+        if busy:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()
+        else:
+            QApplication.restoreOverrideCursor()
+
     def _record_from_form(self) -> TaskRecord:
         data = self._record.as_dict()
         for field_name in self._form_fields:
@@ -295,6 +314,7 @@ class TaskEditDialog(QDialog):
         self._cancel_pick(silent=True)
         updated = self._record_from_form()
 
+        self._set_busy(True)
         try:
             update_task_record(self._conn, updated, self._store_cfg)
             result = send_fn(self._conn, updated, self._store_cfg)
@@ -308,6 +328,8 @@ class TaskEditDialog(QDialog):
                 f"{error_prefix}:\n{exc}",
             )
             return
+        finally:
+            self._set_busy(False)
 
         self._record = updated
         QMessageBox.information(
@@ -338,6 +360,14 @@ class TaskEditDialog(QDialog):
             "Задача закрыта как нелегальная.",
             "Задача уже была закрыта как нелегальная.",
             "Не удалось закрыть задачу как нелегальную",
+        )
+
+    def _on_disruption_absent(self) -> None:
+        self._send_task_snapshot(
+            send_task_to_clear,
+            "Задача отмечена: разрытие отсутствует.",
+            "Задача уже была отмечена как «разрытие отсутствует».",
+            "Не удалось сохранить задачу в tasks_clear",
         )
 
     def reject(self) -> None:

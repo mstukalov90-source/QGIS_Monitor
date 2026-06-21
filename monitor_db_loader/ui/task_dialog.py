@@ -34,8 +34,10 @@ from ..core.config import crm_task_store
 from ..core.crm_task_store import (
     fetch_task_for_feature,
     filter_sent_tasks_from_result,
+    ensure_all_snapshot_tables,
 )
 from ..core.crm_tasks import TaskFeature, TaskResult, TaskSubgroup, _connect_with_password
+from ..core.log_util import log_warning
 from ..core.task_dxf_export import export_tasks_to_dxf, export_tasks_to_shp
 from ..core.db import DatabaseConnection
 from ..core.layer_utils import refresh_map_canvas
@@ -147,6 +149,11 @@ class TaskDialog(QDialog):
         layout.addWidget(buttons)
 
         if self._db_conn and self._store_cfg:
+            if not ensure_all_snapshot_tables(self._db_conn, self._store_cfg):
+                log_warning(
+                    "Не все snapshot-таблицы CRM подготовлены — "
+                    "фильтр отправленных задач может работать неполностью"
+                )
             self._apply_snapshot_filter()
         else:
             self._populate_tree()

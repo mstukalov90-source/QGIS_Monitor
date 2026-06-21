@@ -72,34 +72,16 @@ _DDL_STATEMENTS = (
         station_avr TEXT
     )
     """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_photo_uuid
-        ON crm.tasks (photo_uuid) WHERE photo_uuid IS NOT NULL
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_photo_lens
-        ON crm.tasks (photo_lens) WHERE photo_lens IS NOT NULL
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_ogh_id
-        ON crm.tasks (ogh_id) WHERE ogh_id IS NOT NULL
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_oati_id
-        ON crm.tasks (oati_id) WHERE oati_id IS NOT NULL
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_earthwork_id
-        ON crm.tasks (earthwork_id) WHERE earthwork_id IS NOT NULL
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_localwork_id
-        ON crm.tasks (localwork_id) WHERE localwork_id IS NOT NULL
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_avr_mos_id
-        ON crm.tasks (avr_mos_id) WHERE avr_mos_id IS NOT NULL
-    """,
+)
+
+_DROP_TASK_ID_UNIQUE_INDEXES = (
+    "DROP INDEX IF EXISTS crm.tasks_uq_photo_uuid",
+    "DROP INDEX IF EXISTS crm.tasks_uq_photo_lens",
+    "DROP INDEX IF EXISTS crm.tasks_uq_ogh_id",
+    "DROP INDEX IF EXISTS crm.tasks_uq_oati_id",
+    "DROP INDEX IF EXISTS crm.tasks_uq_earthwork_id",
+    "DROP INDEX IF EXISTS crm.tasks_uq_localwork_id",
+    "DROP INDEX IF EXISTS crm.tasks_uq_avr_mos_id",
 )
 
 
@@ -209,8 +191,38 @@ def _pg_connection(conn: DatabaseConnection):
     return conn._get_pg_connection()
 
 
+def _pg_rollback(pg) -> None:
+    if pg is None:
+        return
+    try:
+        pg.rollback()
+    except Exception:
+        pass
+
+
+def _pg_recover_transaction(pg) -> None:
+    """Сбросить прерванную транзакцию (InFailedSqlTransaction) перед новым запросом."""
+    if pg is None or psycopg2 is None:
+        return
+    try:
+        from psycopg2.extensions import TRANSACTION_STATUS_INERROR
+
+        if pg.get_transaction_status() == TRANSACTION_STATUS_INERROR:
+            pg.rollback()
+    except Exception:
+        _pg_rollback(pg)
+
+
+def _schema_cache(conn: DatabaseConnection) -> Set[str]:
+    return conn._crm_schema_ready
+
+
 def ensure_tasks_table(conn: DatabaseConnection) -> bool:
     """Создать схему crm и таблицу tasks при отсутствии."""
+    cache = _schema_cache(conn)
+    if "crm.tasks" in cache:
+        return True
+
     pg = _pg_connection(conn)
     if pg is None:
         log_warning("psycopg2 недоступен — запись задач в БД невозможна")
@@ -223,14 +235,14 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
                 cur.execute(stmt)
             for stmt in _station_migration_statements(schema, table):
                 cur.execute(stmt)
+            for stmt in _DROP_TASK_ID_UNIQUE_INDEXES:
+                cur.execute(stmt)
         pg.commit()
+        cache.add("crm.tasks")
         log_info("Таблица crm.tasks проверена/создана")
         return True
     except Exception as exc:
-        try:
-            pg.rollback()
-        except Exception:
-            pass
+        _pg_rollback(pg)
         log_warning(f"Не удалось создать crm.tasks: {exc}")
         return False
 
@@ -327,6 +339,11 @@ def ensure_task_snapshot_table(
     snapshot_schema, snapshot_table = _snapshot_table_ref(
         store_cfg, config_key, default_table
     )
+    cache_key = f"{snapshot_schema}.{snapshot_table}"
+    cache = _schema_cache(conn)
+    if cache_key in cache:
+        return True
+
     pg = _pg_connection(conn)
     if pg is None:
         log_warning(f"psycopg2 недоступен — запись в {snapshot_table} невозможна")
@@ -339,13 +356,11 @@ def ensure_task_snapshot_table(
             for stmt in _station_migration_statements(snapshot_schema, snapshot_table):
                 cur.execute(stmt)
         pg.commit()
+        cache.add(cache_key)
         log_info(f"Таблица {snapshot_schema}.{snapshot_table} проверена/создана")
         return True
     except Exception as exc:
-        try:
-            pg.rollback()
-        except Exception:
-            pass
+        _pg_rollback(pg)
         log_warning(
             f"Не удалось создать {snapshot_schema}.{snapshot_table}: {exc}"
         )
@@ -358,6 +373,14 @@ def ensure_tasks_field_table(
     return ensure_task_snapshot_table(
         conn, store_cfg, "field_table", "tasks_field"
     )
+
+
+_SNAPSHOT_TABLES = (
+    ("field_table", "tasks_field"),
+    ("done_legal_table", "tasks_done_legal"),
+    ("done_illegal_table", "tasks_done_illegal"),
+    ("clear_table", "tasks_clear"),
+)
 
 
 def task_key_exists_in_snapshot(
@@ -373,9 +396,14 @@ def task_key_exists_in_snapshot(
         return False
 
     query = f'SELECT 1 FROM "{schema}"."{table}" WHERE task_key = %s LIMIT 1'
-    with pg.cursor() as cur:
-        cur.execute(query, (task_key,))
-        return cur.fetchone() is not None
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, (task_key,))
+            return cur.fetchone() is not None
+    except Exception:
+        _pg_rollback(pg)
+        return False
 
 
 def task_key_exists_in_field(
@@ -388,22 +416,32 @@ def task_key_exists_in_field(
     )
 
 
-_SNAPSHOT_TABLES = (
-    ("field_table", "tasks_field"),
-    ("done_legal_table", "tasks_done_legal"),
-    ("done_illegal_table", "tasks_done_illegal"),
-)
+def ensure_all_snapshot_tables(
+    conn: DatabaseConnection, store_cfg: Dict[str, Any]
+) -> bool:
+    """Подготовить crm.tasks и все snapshot-таблицы (один раз за сессию)."""
+    if not ensure_tasks_table(conn):
+        return False
+    ok = True
+    for config_key, default_table in _SNAPSHOT_TABLES:
+        if not ensure_task_snapshot_table(
+            conn, store_cfg, config_key, default_table
+        ):
+            ok = False
+    return ok
 
 
 def fetch_snapshot_task_keys(
     conn: DatabaseConnection,
     store_cfg: Dict[str, Any],
 ) -> Set[str]:
-    """Все task_key из tasks_field, tasks_done_legal, tasks_done_illegal."""
+    """Все task_key из tasks_field, tasks_done_*, tasks_clear."""
     keys: Set[str] = set()
     pg = _pg_connection(conn)
     if pg is None:
         return keys
+
+    _pg_recover_transaction(pg)
 
     for config_key, default_table in _SNAPSHOT_TABLES:
         schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
@@ -414,8 +452,11 @@ def fetch_snapshot_task_keys(
                 for row in cur.fetchall():
                     if row[0]:
                         keys.add(str(row[0]))
-        except Exception:
-            continue
+        except Exception as exc:
+            _pg_rollback(pg)
+            log_warning(
+                f"Не удалось загрузить task_key из {schema}.{table}: {exc}"
+            )
     return keys
 
 
@@ -432,6 +473,7 @@ def fetch_task_keys_index(
     col_list = ", ".join(f'"{col}"' for col in ("key",) + TASK_ID_COLUMNS)
     query = f'SELECT {col_list} FROM "{schema}"."{table}"'
     index: Dict[Tuple[str, str], str] = {}
+    _pg_recover_transaction(pg)
     try:
         with pg.cursor() as cur:
             cur.execute(query)
@@ -442,6 +484,7 @@ def fetch_task_keys_index(
                     if value:
                         index[(col, value)] = key
     except Exception as exc:
+        _pg_rollback(pg)
         log_warning(f"Не удалось загрузить индекс crm.tasks: {exc}")
     return index
 
@@ -524,10 +567,7 @@ def send_task_snapshot(
         log_info(f"crm.{table}: отправлена задача {record.key}")
         return "inserted"
     except Exception:
-        try:
-            pg.rollback()
-        except Exception:
-            pass
+        _pg_rollback(pg)
         raise
 
 
@@ -561,6 +601,16 @@ def send_task_to_done_illegal(
     )
 
 
+def send_task_to_clear(
+    conn: DatabaseConnection,
+    record: TaskRecord,
+    store_cfg: Dict[str, Any],
+) -> SendTaskSnapshotResult:
+    return send_task_snapshot(
+        conn, record, store_cfg, "clear_table", "tasks_clear"
+    )
+
+
 def fetch_task(
     conn: DatabaseConnection,
     store_cfg: Dict[str, Any],
@@ -582,10 +632,18 @@ def fetch_task(
         f'SELECT {columns} FROM "{schema}"."{table}" '
         f'WHERE "{task_column}" = %s LIMIT 1'
     )
-    with pg.cursor() as cur:
-        cur.execute(query, (business_id,))
-        row = cur.fetchone()
-    return TaskRecord.from_row(row) if row else None
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, (business_id,))
+            row = cur.fetchone()
+        return TaskRecord.from_row(row) if row else None
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(
+            f"Не удалось загрузить задачу crm.tasks ({task_column}={business_id}): {exc}"
+        )
+        return None
 
 
 def fetch_task_for_feature(
@@ -636,22 +694,6 @@ def task_form_field_groups(
     return readonly, link
 
 
-def _duplicate_exists(
-    cur,
-    schema: str,
-    table: str,
-    column: str,
-    value: str,
-    exclude_key: str,
-) -> bool:
-    query = (
-        f'SELECT 1 FROM "{schema}"."{table}" '
-        f'WHERE "{column}" = %s AND key <> %s LIMIT 1'
-    )
-    cur.execute(query, (value, exclude_key))
-    return cur.fetchone() is not None
-
-
 def update_task_record(
     conn: DatabaseConnection,
     record: TaskRecord,
@@ -675,15 +717,6 @@ def update_task_record(
 
     try:
         with pg.cursor() as cur:
-            for column, value in id_values.items():
-                if value is None:
-                    continue
-                if _duplicate_exists(cur, schema, table, column, value, record.key):
-                    label = TASK_COLUMN_LABELS.get(column, column)
-                    raise ValueError(
-                        f"Значение «{value}» для «{label}» уже используется в другой задаче"
-                    )
-
             all_columns = list(TASK_ID_COLUMNS) + list(STATION_COLUMNS)
             set_parts = ['"type" = %s'] + [f'"{col}" = %s' for col in all_columns]
             params: List[Any] = [task_type] + [
@@ -701,10 +734,7 @@ def update_task_record(
         pg.commit()
         log_info(f"crm.tasks: обновлена задача {record.key}")
     except Exception:
-        try:
-            pg.rollback()
-        except Exception:
-            pass
+        _pg_rollback(pg)
         raise
 
 
@@ -772,10 +802,7 @@ def persist_task_result(
             f"пропущено {stats.skipped}, без ID {stats.invalid}"
         )
     except Exception as exc:
-        try:
-            pg.rollback()
-        except Exception:
-            pass
+        _pg_rollback(pg)
         log_warning(f"Ошибка записи в crm.tasks: {exc}")
         raise
 

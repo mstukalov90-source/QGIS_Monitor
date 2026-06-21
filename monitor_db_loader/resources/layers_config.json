@@ -649,6 +649,7 @@
       "field_table": "tasks_field",
       "done_legal_table": "tasks_done_legal",
       "done_illegal_table": "tasks_done_illegal",
+      "clear_table": "tasks_clear",
       "subgroups": {
         "Фото после обработки ИИ": {
           "task_column": "photo_uuid",
