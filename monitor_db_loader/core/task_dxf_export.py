@@ -189,7 +189,11 @@ def _collect_export_items(
                     continue
 
                 qgs_layer = task_feat.layer
-                if not qgs_layer or not qgs_layer.isValid():
+                if (
+                    not qgs_layer
+                    or not qgs_layer.isValid()
+                    or task_feat.feature_id is None
+                ):
                     stats.skipped_invalid += 1
                     continue
 

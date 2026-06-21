@@ -5,14 +5,20 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from qgis.core import QgsCoordinateReferenceSystem, QgsFeature, QgsProject, QgsVectorLayer
+from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsFeature,
+    QgsGeometry,
+    QgsProject,
+    QgsVectorLayer,
+)
 from qgis.PyQt.QtCore import QDate, QDateTime
 from qgis.PyQt.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from ..ui.district_dialog import DistrictDialog
 from ..ui.password_dialog import PasswordDialog
 from .config import crm_task_store, crm_tasks, database_connection
-from .crm_task_store import persist_task_result
+from .crm_task_store import ensure_all_snapshot_tables, persist_task_result
 from .db import DatabaseConnection
 from .district_utils import (
     DistrictBoundary,
@@ -27,10 +33,14 @@ from .qt_compat import MSGBOX_CANCEL, MSGBOX_RETRY
 
 @dataclass
 class TaskFeature:
-    layer: QgsVectorLayer
+    layer: Optional[QgsVectorLayer]
     layer_name: str
-    feature_id: int
+    feature_id: Optional[int]
     attributes: Dict[str, Any]
+    task_key: Optional[str] = None
+    sent_at: Optional[str] = None
+    area_geom: Optional[QgsGeometry] = None
+    layer_key: Optional[str] = None
 
 
 @dataclass
@@ -54,6 +64,7 @@ class TaskResult:
     apply_date_filter: bool = True
     groups: List[TaskGroup] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    task_source: str = "active"
 
     @property
     def total_count(self) -> int:
@@ -62,6 +73,45 @@ class TaskResult:
             for group in self.groups
             for sub in group.subgroups
         )
+
+
+def copy_task_feature(feat: TaskFeature) -> TaskFeature:
+    """Копия TaskFeature без deepcopy (QgsVectorLayer/QgsGeometry не копируются)."""
+    return TaskFeature(
+        layer=feat.layer,
+        layer_name=feat.layer_name,
+        feature_id=feat.feature_id,
+        attributes=dict(feat.attributes),
+        task_key=feat.task_key,
+        sent_at=feat.sent_at,
+        area_geom=feat.area_geom,
+        layer_key=feat.layer_key,
+    )
+
+
+def copy_task_result(result: TaskResult) -> TaskResult:
+    """Копия TaskResult для снимка «активных» задач до фильтрации."""
+    groups: List[TaskGroup] = []
+    for group in result.groups:
+        subgroups: List[TaskSubgroup] = []
+        for sub in group.subgroups:
+            subgroups.append(
+                TaskSubgroup(
+                    name=sub.name,
+                    features=[copy_task_feature(f) for f in sub.features],
+                    date_field=sub.date_field,
+                )
+            )
+        groups.append(TaskGroup(name=group.name, subgroups=subgroups))
+    return TaskResult(
+        district_name=result.district_name,
+        filter_date_from=result.filter_date_from,
+        filter_date_to=result.filter_date_to,
+        apply_date_filter=result.apply_date_filter,
+        groups=groups,
+        errors=list(result.errors),
+        task_source=result.task_source,
+    )
 
 
 _DATE_TEXT_FORMATS = (
@@ -219,8 +269,9 @@ def _build_task_result(
         for sub_cfg in group_cfg.get("subgroups", []):
             step += 1
             progress.setValue(step)
+            sub_name = sub_cfg.get("name", "")
             progress.setLabelText(
-                f"Сбор объектов: {sub_cfg.get('name', '')}…"
+                f"Слой {step}/{total_steps}: {sub_name}…"
             )
             QApplication.processEvents()
             if progress.wasCanceled():
@@ -266,7 +317,7 @@ def _connect_with_password(config: Dict[str, Any], parent) -> Optional[DatabaseC
     connection_name = db_cfg.get("connection_name", "Monitor DB Connection")
 
     while True:
-        password = PasswordDialog.ask(connection_name, parent)
+        password = PasswordDialog.ask(connection_name, parent, crm_theme=True)
         if password is None:
             return None
 
@@ -297,26 +348,26 @@ def _persist_tasks_to_db(
         log_warning("Секция crm_tasks.task_store отсутствует — запись в БД пропущена")
         return None
 
-    if task_result.total_count == 0:
-        log_info("Нет объектов для записи в crm.tasks")
-        return None
-
     conn = _connect_with_password(config, parent)
     if conn is None:
-        log_info("Запись в crm.tasks отменена (пароль не введён)")
+        log_info("Подключение к БД отменено (пароль не введён)")
         return None
+
+    if not ensure_all_snapshot_tables(conn, store_cfg):
+        log_warning(
+            "Не все snapshot-таблицы CRM подготовлены — "
+            "отправка задач может завершиться ошибкой"
+        )
+
+    if task_result.total_count == 0:
+        log_info(
+            "Нет объектов слоёв для записи в crm.tasks; "
+            "подключение сохранено для площадных заказов"
+        )
+        return conn
 
     try:
         stats = persist_task_result(conn, task_result, store_cfg)
-        QMessageBox.information(
-            parent,
-            "Monitor DB Loader — задачи",
-            f"Запись в crm.tasks:\n"
-            f"• Добавлено: {stats.inserted}\n"
-            f"• Уже в БД: {stats.skipped}\n"
-            f"• Без ID: {stats.invalid}",
-        )
-        return conn
     except Exception as exc:
         conn.close()
         QMessageBox.warning(
@@ -326,6 +377,29 @@ def _persist_tasks_to_db(
             f"Список объектов будет показан без сохранения.",
         )
         return None
+
+    processed = stats.inserted + stats.skipped + stats.invalid
+    if processed == 0:
+        log_info("crm.tasks: нечего записывать (0 объектов с ID на слоях)")
+        return conn
+
+    if stats.inserted > 0 or stats.skipped > 0:
+        QMessageBox.information(
+            parent,
+            "Monitor DB Loader — задачи",
+            f"Запись в crm.tasks:\n"
+            f"• Добавлено: {stats.inserted}\n"
+            f"• Уже в БД: {stats.skipped}\n"
+            f"• Без ID: {stats.invalid}",
+        )
+    elif stats.invalid > 0:
+        QMessageBox.warning(
+            parent,
+            "Monitor DB Loader — задачи",
+            f"Не удалось сохранить задачи в crm.tasks:\n"
+            f"• Без ID (нет поля-идентификатора): {stats.invalid}",
+        )
+    return conn
 
 
 def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
@@ -444,13 +518,13 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
     groups_cfg = cfg.get("groups", [])
     total_steps = sum(len(g.get("subgroups", [])) for g in groups_cfg)
     progress = QProgressDialog(
-        "Сбор задач…",
+        "Подготовка…",
         "Отмена",
         0,
         max(total_steps, 1),
         parent or iface.mainWindow(),
     )
-    progress.setWindowTitle("Monitor DB Loader")
+    progress.setWindowTitle("Monitor CRM")
     progress.setMinimumDuration(0)
     progress.setValue(0)
 
@@ -472,18 +546,46 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
 
     log_info(
         f"Получить задачу завершено: район «{district.name}», "
-        f"всего {task_result.total_count} объектов"
+        f"объектов на слоях: {task_result.total_count}"
     )
 
+    task_result.task_source = "active"
     db_conn = _persist_tasks_to_db(config, task_result, parent or iface.mainWindow())
 
+    if db_conn is not None:
+        from .crm_tasks_area import preload_area_geometries
+
+        area_progress = QProgressDialog(
+            "Загрузка площадных заказов…",
+            None,
+            0,
+            0,
+            parent or iface.mainWindow(),
+        )
+        area_progress.setWindowTitle("Monitor CRM")
+        area_progress.setMinimumDuration(0)
+        area_progress.show()
+        QApplication.processEvents()
+        try:
+            preload_area_geometries(db_conn, district.name)
+        except Exception as exc:
+            log_warning(f"Предзагрузка площадных заказов не удалась: {exc}")
+        finally:
+            area_progress.close()
+
     from ..ui.task_dialog import TaskDialog
+
+    def _restart():
+        run_get_task(config, iface, parent)
 
     TaskDialog.open(
         task_result,
         iface,
         config=config,
         db_conn=db_conn,
+        district=district,
+        apply_date_filter=apply_date_filter,
+        on_change_district=_restart,
     )
 
     return task_result

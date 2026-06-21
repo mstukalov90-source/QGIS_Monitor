@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Диалог списка задач CRM по району."""
 
-from typing import Any, List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 from qgis.core import (
     QgsCoordinateTransform,
@@ -11,7 +11,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from qgis.gui import QgsHighlight
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -30,33 +30,56 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..core.crm_area_map import TasksAreaMapController
 from ..core.config import crm_task_store
+from ..core.crm_snapshot_loader import collect_snapshot_tasks
 from ..core.crm_task_store import (
+    fetch_task_by_key,
     fetch_task_for_feature,
     filter_sent_tasks_from_result,
-    ensure_all_snapshot_tables,
 )
-from ..core.crm_tasks import TaskFeature, TaskResult, TaskSubgroup, _connect_with_password
+from ..core.crm_tasks import (
+    TaskFeature,
+    TaskResult,
+    TaskSubgroup,
+    _connect_with_password,
+    copy_task_result,
+)
+from ..core.crm_tasks_area import (
+    collect_tasks_area,
+    complete_area_survey,
+    invalidate_area_geometries_cache,
+    preload_area_geometries,
+    release_area_from_survey,
+    send_area_to_survey,
+)
+from ..core.crm_ui_constants import (
+    AREA_STATUS_LABELS,
+    SNAPSHOT_SOURCES,
+    TASK_SOURCE_LABELS,
+    area_status_from_source,
+    format_area_order_label,
+    format_task_table_cell,
+    is_area_source,
+    resolve_task_table_columns,
+    task_execute_button_label,
+)
+from ..core.db import DatabaseConnection
+from ..core.district_utils import DistrictBoundary
+from ..core.layer_utils import refresh_map_canvas
 from ..core.log_util import log_warning
 from ..core.task_dxf_export import export_tasks_to_dxf, export_tasks_to_shp
-from ..core.db import DatabaseConnection
-from ..core.layer_utils import refresh_map_canvas
 from ..core.qt_compat import BTN_OK, TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
+from .crm_source_tabs import TaskSourceTabs
+from .crm_theme import apply_crm_theme, style_button
 
 TreeRole = Tuple[str, ...]
 
 
-def _format_value(value: Any) -> str:
-    if value is None:
+def _format_sent_at(sent_at: Optional[str]) -> str:
+    if not sent_at:
         return ""
-    return str(value)
-
-
-def _subgroup_field_names(subgroup: TaskSubgroup) -> List[str]:
-    names: Set[str] = set()
-    for feat in subgroup.features:
-        names.update(feat.attributes.keys())
-    return sorted(names)
+    return format_task_table_cell(sent_at, "datetime")
 
 
 class TaskDialog(QDialog):
@@ -68,40 +91,65 @@ class TaskDialog(QDialog):
         *,
         config: Optional[dict] = None,
         db_conn: Optional[DatabaseConnection] = None,
+        district: Optional[DistrictBoundary] = None,
+        apply_date_filter: bool = True,
+        on_change_district=None,
     ):
         super().__init__(parent)
         self._result = result
+        self._active_result = copy_task_result(result)
         self._iface = iface
         self._config = config
         self._db_conn = db_conn
+        self._own_db_conn = False
         self._store_cfg = crm_task_store(config) if config else {}
+        self._district = district
+        self._apply_date_filter = apply_date_filter
+        self._on_change_district = on_change_district
+        self._task_source = result.task_source or "active"
         self._highlight: Optional[QgsHighlight] = None
         self._current_group_name = ""
         self._current_subgroup: Optional[TaskSubgroup] = None
         self._selected_task_feat: Optional[TaskFeature] = None
         self._selected_row: Optional[int] = None
+        self._table_columns: List = []
+        self._busy = False
+        district_name = (
+            district.name if district else result.district_name
+        )
+        self._area_map = TasksAreaMapController(iface, district_name)
 
         self.setWindowTitle(f"Задачи — {result.district_name}")
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
-        self.resize(960, 560)
+        self.resize(980, 620)
+        apply_crm_theme(self)
 
         layout = QVBoxLayout(self)
 
-        if result.apply_date_filter:
-            subtitle = QLabel(
-                f"Район: <b>{result.district_name}</b> · "
-                f"Период отбора ордеров/уведомлений: "
-                f"<b>{result.filter_date_from.toString('dd.MM.yyyy')}</b> — "
-                f"<b>{result.filter_date_to.toString('dd.MM.yyyy')}</b>"
-            )
-        else:
-            subtitle = QLabel(
-                f"Район: <b>{result.district_name}</b> · "
-                f"Ордера и уведомления: <b>без фильтра по дате</b>"
-            )
-        subtitle.setTextFormat(TEXT_FORMAT_RICH)
-        layout.addWidget(subtitle)
+        header = QHBoxLayout()
+        self._district_label = QLabel("")
+        self._district_label.setTextFormat(TEXT_FORMAT_RICH)
+        header.addWidget(self._district_label, stretch=1)
+
+        self._change_district_btn = QPushButton("Сменить район")
+        self._change_district_btn.clicked.connect(self._on_change_district)
+        header.addWidget(self._change_district_btn)
+
+        self._refresh_btn = QPushButton("Обновить")
+        style_button(self._refresh_btn, "crmBtnPrimary")
+        self._refresh_btn.clicked.connect(self._on_refresh)
+        header.addWidget(self._refresh_btn)
+        layout.addLayout(header)
+
+        self._meta_label = QLabel("")
+        self._meta_label.setObjectName("crmMuted")
+        layout.addWidget(self._meta_label)
+
+        self._source_tabs = TaskSourceTabs()
+        self._source_tabs.set_value(self._task_source)
+        self._source_tabs.sourceChanged.connect(self._on_source_changed)
+        layout.addWidget(self._source_tabs)
 
         splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(splitter)
@@ -124,13 +172,32 @@ class TaskDialog(QDialog):
         splitter.setStretchFactor(1, 2)
 
         self.status_label = QLabel("")
+        self.status_label.setObjectName("crmMuted")
         layout.addWidget(self.status_label)
 
         action_row = QHBoxLayout()
-        self.execute_btn = QPushButton("Исполнить задачу")
+        self.execute_btn = QPushButton(task_execute_button_label(self._task_source))
+        style_button(self.execute_btn, "crmBtnPrimary")
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._on_execute_task)
         action_row.addWidget(self.execute_btn)
+
+        self._area_send_btn = QPushButton("Отправить на полевое обследование")
+        style_button(self._area_send_btn, "crmBtnPrimary")
+        self._area_send_btn.hide()
+        self._area_send_btn.clicked.connect(self._on_send_area_to_survey)
+        action_row.addWidget(self._area_send_btn)
+
+        self._area_release_btn = QPushButton("Снять с обследования")
+        self._area_release_btn.hide()
+        self._area_release_btn.clicked.connect(self._on_release_area_from_survey)
+        action_row.addWidget(self._area_release_btn)
+
+        self._area_complete_btn = QPushButton("Завершить обследование")
+        style_button(self._area_complete_btn, "crmBtnPrimary")
+        self._area_complete_btn.hide()
+        self._area_complete_btn.clicked.connect(self._on_complete_area_survey)
+        action_row.addWidget(self._area_complete_btn)
 
         self.export_dxf_btn = QPushButton("Экспорт задач в DXF")
         self.export_dxf_btn.clicked.connect(self._on_export_dxf)
@@ -148,40 +215,118 @@ class TaskDialog(QDialog):
         buttons.accepted.connect(self.close)
         layout.addWidget(buttons)
 
-        if self._db_conn and self._store_cfg:
-            if not ensure_all_snapshot_tables(self._db_conn, self._store_cfg):
-                log_warning(
-                    "Не все snapshot-таблицы CRM подготовлены — "
-                    "фильтр отправленных задач может работать неполностью"
-                )
+        self._update_header()
+        if self._db_conn and self._store_cfg and self._task_source == "active":
             self._apply_snapshot_filter()
         else:
             self._populate_tree()
-            self.status_label.setText(self._status_text())
+            self._update_status()
             self._update_action_buttons()
 
         first_subgroup = self._first_subgroup_item()
         if first_subgroup:
             self.tree.setCurrentItem(first_subgroup)
+        QTimer.singleShot(0, self._deferred_map_refresh)
 
-    def _status_text(self) -> str:
-        return f"Активных задач в районе: {self._result.total_count}"
+    def _deferred_map_refresh(self) -> None:
+        self._refresh_area_map()
+        self._update_header()
+
+    def _refresh_area_map(self) -> None:
+        if not self._area_map:
+            return
+        self._area_map.refresh(
+            self._task_source,
+            self._result,
+            self._db_conn,
+            is_area_source=self._is_area(),
+        )
+
+    def _area_status_message(self) -> Optional[str]:
+        if not self._is_area():
+            return None
+        if self._result.total_count > 0:
+            return None
+        status = area_status_from_source(self._task_source)
+        label = AREA_STATUS_LABELS.get(status or "", status or "")
+        return f"Нет площадных заказов ({label}) в районе «{self._result.district_name}»"
+
+    def _update_header(self) -> None:
+        name = self._result.district_name
+        source_label = TASK_SOURCE_LABELS.get(self._task_source, self._task_source)
+        self._district_label.setText(f"Район: <b>{name}</b>")
+
+        parts = [f"{source_label}: {self._result.total_count}"]
+        if (
+            self._task_source == "active"
+            and self._result.total_count == 0
+            and self._area_map
+            and self._area_map.overlay_count > 0
+        ):
+            parts.append(
+                f"Площадные заказы на карте: {self._area_map.overlay_count}"
+            )
+        if self._task_source == "active" and self._result.apply_date_filter:
+            parts.append(
+                f"Период: {self._result.filter_date_from.toString('dd.MM.yyyy')} — "
+                f"{self._result.filter_date_to.toString('dd.MM.yyyy')}"
+            )
+        elif self._task_source == "active":
+            parts.append("Без фильтра по дате")
+        self._meta_label.setText(" · ".join(parts))
+
+    def _update_status(self) -> None:
+        self._update_header()
+        self._update_action_buttons()
+        area_msg = self._area_status_message()
+        if area_msg:
+            self.status_label.setText(area_msg)
+        else:
+            self.status_label.clear()
+
+    def _is_area(self) -> bool:
+        return is_area_source(self._task_source)
+
+    def _show_sent_at(self) -> bool:
+        return not self._is_area() and self._task_source != "active"
 
     def _update_action_buttons(self) -> None:
+        is_area = self._is_area()
+        self.execute_btn.setVisible(not is_area)
+        self.execute_btn.setText(task_execute_button_label(self._task_source))
+        self._area_send_btn.setVisible(is_area)
+        self._area_release_btn.setVisible(is_area)
+        self._area_complete_btn.setVisible(is_area)
+
         enabled = self._result.total_count > 0
-        self.export_dxf_btn.setEnabled(enabled)
-        self.export_shp_btn.setEnabled(enabled)
+        self.export_dxf_btn.setEnabled(enabled and not is_area)
+        self.export_shp_btn.setEnabled(enabled and not is_area)
+
+        if is_area:
+            self._update_area_buttons()
+
+        self.execute_btn.setEnabled(
+            not is_area and self._selected_task_feat is not None and not self._busy
+        )
+
+    def _update_area_buttons(self) -> None:
+        feat = self._selected_task_feat
+        status = str(feat.attributes.get("status", "")) if feat else ""
+        can_send = bool(feat) and status != "wip"
+        can_manage = bool(feat) and status == "wip"
+        self._area_send_btn.setVisible(can_send)
+        self._area_release_btn.setVisible(can_manage)
+        self._area_complete_btn.setVisible(can_manage)
+        self._area_send_btn.setEnabled(can_send and not self._busy)
+        self._area_release_btn.setEnabled(can_manage and not self._busy)
+        self._area_complete_btn.setEnabled(can_manage and not self._busy)
 
     def _apply_snapshot_filter(self) -> None:
         if not self._db_conn or not self._store_cfg:
             return
-
-        filter_sent_tasks_from_result(
-            self._result, self._db_conn, self._store_cfg
-        )
+        filter_sent_tasks_from_result(self._result, self._db_conn, self._store_cfg)
         self._populate_tree()
         self._clear_row_selection()
-
         if self._current_subgroup and self._current_subgroup.features:
             self._fill_table(self._current_subgroup)
         else:
@@ -190,28 +335,22 @@ class TaskDialog(QDialog):
                 self.tree.setCurrentItem(first_subgroup)
             else:
                 self._fill_table(None)
-
-        self.status_label.setText(self._status_text())
-        self._update_action_buttons()
+        self._refresh_area_map()
+        self._update_status()
 
     def _populate_tree(self) -> None:
         self.tree.clear()
-
         for group_index, group in enumerate(self._result.groups):
             group_count = sum(len(sub.features) for sub in group.subgroups)
-            group_item = QTreeWidgetItem(
-                [f"{group.name} ({group_count})"]
-            )
+            group_item = QTreeWidgetItem([f"{group.name} ({group_count})"])
             group_item.setData(0, Qt.UserRole, ("group", group_index))
             self.tree.addTopLevelItem(group_item)
-
             for sub_index, subgroup in enumerate(group.subgroups):
                 sub_item = QTreeWidgetItem(
                     [f"{subgroup.name} ({len(subgroup.features)})"]
                 )
                 sub_item.setData(0, Qt.UserRole, ("sub", group_index, sub_index))
                 group_item.addChild(sub_item)
-
             group_item.setExpanded(True)
 
     def _first_subgroup_item(self) -> Optional[QTreeWidgetItem]:
@@ -280,6 +419,9 @@ class TaskDialog(QDialog):
         self.table.blockSignals(True)
         self.table.clearSelection()
         self.table.blockSignals(False)
+        self._update_area_buttons()
+        if self._area_map:
+            self._area_map.clear_selection()
 
     def _fill_table(self, subgroup: Optional[TaskSubgroup]) -> None:
         self.table.blockSignals(True)
@@ -290,18 +432,40 @@ class TaskDialog(QDialog):
             self.table.blockSignals(False)
             return
 
-        field_names = _subgroup_field_names(subgroup)
-        headers = ["Слой", "FID"] + field_names
+        is_area = self._is_area()
+        show_sent_at = self._show_sent_at()
+        attrs_list = [f.attributes for f in subgroup.features]
+        self._table_columns = resolve_task_table_columns(
+            subgroup.name, is_area, attrs_list, show_sent_at
+        )
+
+        headers = ["Заказ" if is_area else "Слой"]
+        if show_sent_at:
+            headers.append("Отправлено")
+        headers.extend(col.label for col in self._table_columns)
+
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setRowCount(len(subgroup.features))
 
         for row, task_feat in enumerate(subgroup.features):
-            self._set_cell(row, 0, task_feat.layer_name)
-            self._set_cell(row, 1, str(task_feat.feature_id))
-            for col, field_name in enumerate(field_names, start=2):
-                value = task_feat.attributes.get(field_name, "")
-                self._set_cell(row, col, _format_value(value))
+            col_idx = 0
+            order_label = (
+                format_area_order_label(task_feat)
+                if is_area
+                else task_feat.layer_name
+            )
+            self._set_cell(row, col_idx, order_label)
+            col_idx += 1
+            if show_sent_at:
+                self._set_cell(row, col_idx, _format_sent_at(task_feat.sent_at))
+                col_idx += 1
+            for col in self._table_columns:
+                value = task_feat.attributes.get(col.field, "")
+                self._set_cell(
+                    row, col_idx, format_task_table_cell(value, col.format)
+                )
+                col_idx += 1
 
         self.table.blockSignals(False)
 
@@ -323,7 +487,8 @@ class TaskDialog(QDialog):
             return
         self._selected_row = row
         self._selected_task_feat = task_feat
-        self.execute_btn.setEnabled(True)
+        self.execute_btn.setEnabled(not self._is_area() and not self._busy)
+        self._update_area_buttons()
         try:
             self._zoom_to_feature(task_feat)
         except Exception:
@@ -338,6 +503,9 @@ class TaskDialog(QDialog):
             self._selected_task_feat = None
             self._selected_row = None
             self.execute_btn.setEnabled(False)
+            self._update_area_buttons()
+            if self._area_map:
+                self._area_map.clear_selection()
             return
         self._select_row(rows[0].row())
 
@@ -346,15 +514,18 @@ class TaskDialog(QDialog):
             return self._db_conn
         if not self._config:
             return None
-        return _connect_with_password(self._config, self)
+        conn = _connect_with_password(self._config, self)
+        if conn is not None:
+            self._db_conn = conn
+            self._own_db_conn = True
+        return conn
 
     def _on_execute_task(self) -> None:
         if not self._selected_task_feat or not self._current_subgroup:
             return
         if not self._store_cfg:
             QMessageBox.warning(
-                self,
-                "Monitor DB Loader — задачи",
+                self, "Monitor DB Loader — задачи",
                 "Конфигурация task_store не найдена.",
             )
             return
@@ -363,16 +534,19 @@ class TaskDialog(QDialog):
         if conn is None:
             return
 
-        own_conn = conn is not self._db_conn
-        record = fetch_task_for_feature(
-            conn,
-            self._current_subgroup.name,
-            self._selected_task_feat.attributes,
-            self._store_cfg,
-        )
+        record = None
+        if self._selected_task_feat.task_key:
+            record = fetch_task_by_key(
+                conn, self._store_cfg, self._selected_task_feat.task_key
+            )
         if record is None:
-            if own_conn:
-                conn.close()
+            record = fetch_task_for_feature(
+                conn,
+                self._current_subgroup.name,
+                self._selected_task_feat.attributes,
+                self._store_cfg,
+            )
+        if record is None:
             QMessageBox.warning(
                 self,
                 "Monitor DB Loader — задачи",
@@ -384,9 +558,7 @@ class TaskDialog(QDialog):
         from .task_edit_dialog import TaskEditDialog
 
         def _on_edit_closed(_result: int) -> None:
-            if own_conn:
-                conn.close()
-            self._apply_snapshot_filter()
+            self._on_refresh()
 
         TaskEditDialog.open_edit(
             record,
@@ -397,195 +569,251 @@ class TaskDialog(QDialog):
             config=self._config,
             subgroup_name=self._current_subgroup.name,
             group_name=self._current_group_name,
+            task_source=self._task_source,
             on_finished=_on_edit_closed,
         )
 
+    def _area_task_key(self) -> Optional[str]:
+        if not self._selected_task_feat:
+            return None
+        key = self._selected_task_feat.task_key or self._selected_task_feat.attributes.get("key")
+        return str(key).strip() if key else None
+
+    def _run_area_action(self, fn, success_msg: str, skip_msg: str) -> None:
+        key = self._area_task_key()
+        if not key:
+            return
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+        self._busy = True
+        self._update_action_buttons()
+        try:
+            result = fn(conn, key)
+            if result == "updated":
+                self.status_label.setText(success_msg)
+                invalidate_area_geometries_cache(conn, self._result.district_name)
+                try:
+                    preload_area_geometries(conn, self._result.district_name)
+                except Exception:
+                    pass
+                self._on_refresh()
+            elif result == "skipped":
+                self.status_label.setText(skip_msg)
+            else:
+                self.status_label.setText("Заказ не найден")
+        finally:
+            self._busy = False
+            self._update_action_buttons()
+
+    def _on_send_area_to_survey(self) -> None:
+        self._run_area_action(
+            send_area_to_survey,
+            "Отправлено на полевое обследование (статус: wip)",
+            "Уже на обследовании (wip)",
+        )
+
+    def _on_release_area_from_survey(self) -> None:
+        self._run_area_action(
+            release_area_from_survey,
+            "Снято с обследования (статус: free)",
+            "Заказ не найден или не на обследовании",
+        )
+
+    def _on_complete_area_survey(self) -> None:
+        self._run_area_action(
+            complete_area_survey,
+            "Обследование завершено (статус: done)",
+            "Заказ не найден или не на обследовании",
+        )
+
+    def _on_change_district(self) -> None:
+        if self._on_change_district:
+            self.close()
+            self._on_change_district()
+
+    def _on_refresh(self) -> None:
+        self._reload_for_source(self._task_source)
+
+    def _on_source_changed(self, source: str) -> None:
+        self._reload_for_source(source)
+
+    def _reload_for_source(self, source: str) -> None:
+        self._source_tabs.set_loading(True)
+        if not self._config or not self._district:
+            if source == "active":
+                self._result = copy_task_result(self._active_result)
+                self._task_source = source
+                self._source_tabs.set_value(source)
+                if self._db_conn and self._store_cfg:
+                    self._apply_snapshot_filter()
+                else:
+                    self._populate_tree()
+                    self._refresh_area_map()
+                    self._update_status()
+                return
+            QMessageBox.warning(
+                self,
+                "Monitor DB Loader — задачи",
+                "Для этого источника нужно подключение к БД и район.",
+            )
+            self._source_tabs.set_value(self._task_source)
+            return
+
+        conn = self._get_db_connection()
+        if conn is None:
+            self._source_tabs.set_value(self._task_source)
+            return
+
+        progress = QProgressDialog("Загрузка задач…", "Отмена", 0, 0, self)
+        progress.setWindowTitle("Monitor CRM")
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        try:
+            if source == "active":
+                self._result = copy_task_result(self._active_result)
+                if self._store_cfg:
+                    filter_sent_tasks_from_result(
+                        self._result, conn, self._store_cfg
+                    )
+            elif source in SNAPSHOT_SOURCES:
+                self._result = collect_snapshot_tasks(
+                    conn, self._district, source, self._config
+                )
+            else:
+                status = area_status_from_source(source)
+                if not status:
+                    raise ValueError(f"Неизвестный источник: {source}")
+                self._result = collect_tasks_area(
+                    conn, self._district.name, status
+                )
+            self._task_source = source
+            self._source_tabs.set_value(source)
+            self._populate_tree()
+            self._clear_row_selection()
+            first = self._first_subgroup_item()
+            if first:
+                self.tree.setCurrentItem(first)
+            else:
+                self._fill_table(None)
+            self._refresh_area_map()
+            self._update_status()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Monitor DB Loader — задачи", str(exc)
+            )
+            self._source_tabs.set_value(self._task_source)
+        finally:
+            progress.close()
+            self._source_tabs.set_loading(False)
+
     def _on_export_dxf(self) -> None:
         if self._result.total_count == 0:
-            QMessageBox.warning(
-                self,
-                "Monitor DB Loader — задачи",
-                "Нет объектов для экспорта.",
-            )
+            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Нет объектов для экспорта.")
             return
-
         if not self._config:
-            QMessageBox.warning(
-                self,
-                "Monitor DB Loader — задачи",
-                "Конфигурация плагина не найдена.",
-            )
+            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Конфигурация плагина не найдена.")
             return
-
         default_name = f"tasks_{self._result.district_name or 'export'}.dxf"
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Экспорт задач в DXF",
-            default_name,
-            "DXF files (*.dxf)",
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт задач в DXF", default_name, "DXF files (*.dxf)")
         if not path:
             return
         if not path.lower().endswith(".dxf"):
             path += ".dxf"
-
-        progress = QProgressDialog(
-            "Экспорт задач в DXF…",
-            "Отмена",
-            0,
-            max(self._result.total_count, 1),
-            self,
-        )
+        progress = QProgressDialog("Экспорт задач в DXF…", "Отмена", 0, max(self._result.total_count, 1), self)
         progress.setWindowTitle("Monitor DB Loader")
         progress.setMinimumDuration(0)
-        progress.setValue(0)
-
         stats = export_tasks_to_dxf(path, self._result, self._config)
         progress.setValue(self._result.total_count)
-
         if stats.errors:
-            QMessageBox.critical(
-                self,
-                "Monitor DB Loader — задачи",
-                "Не удалось экспортировать задачи в DXF:\n"
-                + "\n".join(stats.errors),
-            )
+            QMessageBox.critical(self, "Monitor DB Loader — задачи", "Не удалось экспортировать задачи в DXF:\n" + "\n".join(stats.errors))
             return
-
         QMessageBox.information(
-            self,
-            "Monitor DB Loader — задачи",
-            f"Экспорт завершён.\n\n"
-            f"DXF: {path}\n"
-            f"ID (CSV): {stats.csv_path}\n"
-            f"Объектов: {stats.exported}\n"
-            f"Пропущено (пустая геометрия): {stats.skipped_empty}\n"
-            f"Пропущено (без ID / ошибка): {stats.skipped_invalid}",
+            self, "Monitor DB Loader — задачи",
+            f"Экспорт завершён.\n\nDXF: {path}\nID (CSV): {stats.csv_path}\nОбъектов: {stats.exported}",
         )
 
     def _on_export_shp(self) -> None:
         if self._result.total_count == 0:
-            QMessageBox.warning(
-                self,
-                "Monitor DB Loader — задачи",
-                "Нет объектов для экспорта.",
-            )
+            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Нет объектов для экспорта.")
             return
-
         if not self._config:
-            QMessageBox.warning(
-                self,
-                "Monitor DB Loader — задачи",
-                "Конфигурация плагина не найдена.",
-            )
+            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Конфигурация плагина не найдена.")
             return
-
         default_name = f"tasks_{self._result.district_name or 'export'}.shp"
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Экспорт задач в SHP",
-            default_name,
-            "Shapefile (*.shp)",
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт задач в SHP", default_name, "Shapefile (*.shp)")
         if not path:
             return
         if not path.lower().endswith(".shp"):
             path += ".shp"
-
-        progress = QProgressDialog(
-            "Экспорт задач в SHP…",
-            "Отмена",
-            0,
-            max(self._result.total_count, 1),
-            self,
-        )
+        progress = QProgressDialog("Экспорт задач в SHP…", "Отмена", 0, max(self._result.total_count, 1), self)
         progress.setWindowTitle("Monitor DB Loader")
         progress.setMinimumDuration(0)
-        progress.setValue(0)
-
         stats = export_tasks_to_shp(path, self._result, self._config)
         progress.setValue(self._result.total_count)
-
         if stats.errors:
-            QMessageBox.critical(
-                self,
-                "Monitor DB Loader — задачи",
-                "Не удалось экспортировать задачи в SHP:\n"
-                + "\n".join(stats.errors),
-            )
+            QMessageBox.critical(self, "Monitor DB Loader — задачи", "Не удалось экспортировать задачи в SHP:\n" + "\n".join(stats.errors))
             return
-
-        QMessageBox.information(
-            self,
-            "Monitor DB Loader — задачи",
-            f"Экспорт завершён.\n\n"
-            f"SHP: {path}\n"
-            f"Объектов: {stats.exported}\n"
-            f"Поля: group, subgroup, task_col, id\n"
-            f"Пропущено (пустая геометрия): {stats.skipped_empty}\n"
-            f"Пропущено (без ID / ошибка): {stats.skipped_invalid}",
-        )
+        QMessageBox.information(self, "Monitor DB Loader — задачи", f"Экспорт завершён.\n\nSHP: {path}\nОбъектов: {stats.exported}")
 
     def _ensure_layer_visible(self, layer) -> None:
+        if layer is None:
+            return
         root = QgsProject.instance().layerTreeRoot()
         node = root.findLayer(layer.id())
         if node and not node.isVisible():
             node.setItemVisibilityChecked(True)
             refresh_map_canvas(self._iface)
 
-    def _zoom_extent_for_geometry(
-        self, geom: QgsGeometry, layer_crs, canvas
-    ) -> Optional[QgsRectangle]:
+    def _zoom_extent_for_geometry(self, geom: QgsGeometry, layer_crs, canvas) -> Optional[QgsRectangle]:
         if QgsWkbTypes.geometryType(geom.wkbType()) == QgsWkbTypes.PointGeometry:
             center = geom.asPoint()
             span = 0.0015
-            extent = QgsRectangle(
-                center.x() - span,
-                center.y() - span,
-                center.x() + span,
-                center.y() + span,
-            )
+            extent = QgsRectangle(center.x() - span, center.y() - span, center.x() + span, center.y() + span)
         else:
             extent = geom.boundingBox()
-
         if extent.isNull() or extent.isEmpty():
             return None
-
         dest_crs = canvas.mapSettings().destinationCrs()
         if layer_crs.isValid() and dest_crs.isValid() and layer_crs != dest_crs:
-            extent = QgsCoordinateTransform(
-                layer_crs, dest_crs, QgsProject.instance()
-            ).transform(extent)
-
+            extent = QgsCoordinateTransform(layer_crs, dest_crs, QgsProject.instance()).transform(extent)
         rect = QgsRectangle(extent)
         rect.scale(1.5)
         return rect
 
     def _zoom_to_feature(self, task_feat: TaskFeature) -> None:
-        layer = task_feat.layer
-        if not layer or not layer.isValid():
+        if task_feat.area_geom and not task_feat.area_geom.isEmpty():
+            canvas = self._iface.mapCanvas()
+            rect = self._zoom_extent_for_geometry(
+                task_feat.area_geom, canvas.mapSettings().destinationCrs(), canvas
+            )
+            if rect is None:
+                return
+            canvas.setExtent(rect)
+            canvas.refresh()
+            self._clear_highlight()
+            if self._area_map:
+                self._area_map.highlight_feature(task_feat)
             return
 
+        layer = task_feat.layer
+        if not layer or not layer.isValid() or task_feat.feature_id is None:
+            return
         feat = layer.getFeature(task_feat.feature_id)
         if not feat.isValid():
             return
-
         geom = feat.geometry()
         if not geom or geom.isEmpty():
             return
-
         self._ensure_layer_visible(layer)
-
         canvas = self._iface.mapCanvas()
         rect = self._zoom_extent_for_geometry(geom, layer.crs(), canvas)
         if rect is None:
             return
-
         canvas.setExtent(rect)
         canvas.refresh()
-
         self._clear_highlight()
-
         highlight = QgsHighlight(canvas, feat, layer)
         highlight.setWidth(3)
         highlight.show()
@@ -598,7 +826,7 @@ class TaskDialog(QDialog):
         self._highlight = None
 
     def _close_db_conn(self) -> None:
-        if self._db_conn is not None:
+        if self._own_db_conn and self._db_conn is not None:
             self._db_conn.close()
             self._db_conn = None
 
@@ -611,6 +839,9 @@ class TaskDialog(QDialog):
         *,
         config: Optional[dict] = None,
         db_conn: Optional[DatabaseConnection] = None,
+        district: Optional[DistrictBoundary] = None,
+        apply_date_filter: bool = True,
+        on_change_district=None,
     ) -> "TaskDialog":
         dlg = cls(
             result,
@@ -618,6 +849,9 @@ class TaskDialog(QDialog):
             None,
             config=config,
             db_conn=db_conn,
+            district=district,
+            apply_date_filter=apply_date_filter,
+            on_change_district=on_change_district,
         )
         register_modeless_dialog(iface, dlg)
         show_modeless_dialog(dlg)
@@ -625,5 +859,7 @@ class TaskDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self._clear_highlight()
+        if self._area_map:
+            self._area_map.clear()
         self._close_db_conn()
         super().closeEvent(event)

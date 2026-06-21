@@ -14,6 +14,7 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
     QVBoxLayout,
 )
 
@@ -23,6 +24,7 @@ from ..core.qt_compat import (
     DIALOG_ACCEPTED,
     dialog_exec,
 )
+from .crm_theme import apply_crm_theme, style_button
 
 
 @dataclass
@@ -59,30 +61,44 @@ class DistrictDialog(QDialog):
     ):
         super().__init__(parent)
         title = (
-            "Monitor DB Loader — получить задачу"
+            "Monitor CRM — получить задачу"
             if crm_mode
             else "Monitor DB Loader — выбор района"
         )
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(420, 520 if crm_mode else 480)
+        self.resize(440, 540 if crm_mode else 480)
+
+        if crm_mode:
+            apply_crm_theme(self, object_name="crmDistrictCard")
 
         self._field = field
         self._all_rayons = _collect_rayon_names(layer, field)
         self._date_filter_checkbox: Optional[QCheckBox] = None
 
         layout = QVBoxLayout(self)
+
         if crm_mode:
-            hint = (
-                f"Выберите район (поле «{field}»):\n"
-                f"Слой «{layer.name()}»"
-            )
+            title_label = QLabel("Monitor CRM")
+            title_label.setObjectName("crmTitle")
+            layout.addWidget(title_label)
+            hint = QLabel("Выберите район для загрузки задач из crm.tasks")
+            hint.setObjectName("crmHint")
+            layout.addWidget(hint)
+            layer_hint = QLabel(f"Слой «{layer.name()}», поле «{field}»")
+            layer_hint.setObjectName("crmMuted")
+            layout.addWidget(layer_hint)
         else:
             hint = (
                 f"Выберите район для анализа (поле «{field}»):\n"
                 f"Слой «{layer.name()}»"
             )
-        layout.addWidget(QLabel(hint))
+            layout.addWidget(QLabel(hint))
+
+        search_label = QLabel("Поиск района")
+        if crm_mode:
+            search_label.setObjectName("crmMuted")
+        layout.addWidget(search_label)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Поиск района…")
@@ -106,10 +122,20 @@ class DistrictDialog(QDialog):
             self._date_filter_checkbox.setChecked(True)
             layout.addWidget(self._date_filter_checkbox)
 
-        buttons = QDialogButtonBox(BTN_OK | BTN_CANCEL)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        if crm_mode:
+            self._submit_btn = QPushButton("Получить задачу")
+            style_button(self._submit_btn, "crmBtnPrimary")
+            self._submit_btn.clicked.connect(self._on_accept)
+            layout.addWidget(self._submit_btn)
+
+            buttons = QDialogButtonBox(BTN_CANCEL)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+        else:
+            buttons = QDialogButtonBox(BTN_OK | BTN_CANCEL)
+            buttons.accepted.connect(self._on_accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
 
         self._populate_list(self._all_rayons)
         if self.list_widget.count():

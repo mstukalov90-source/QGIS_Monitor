@@ -33,6 +33,19 @@ class DatabaseConnection:
         self._pg_conn = None
         self._mixed_loader = MixedGeometryLoader(self)
         self._crm_schema_ready: Set[str] = set()
+        self._area_rows_by_rayon: Dict[str, List[Any]] = {}
+
+    def get_area_rows_cache(self, rayon_norm: str) -> Optional[List[Any]]:
+        return self._area_rows_by_rayon.get(rayon_norm)
+
+    def set_area_rows_cache(self, rayon_norm: str, rows: List[Any]) -> None:
+        self._area_rows_by_rayon[rayon_norm] = rows
+
+    def clear_area_rows_cache(self, rayon_norm: Optional[str] = None) -> None:
+        if rayon_norm is None:
+            self._area_rows_by_rayon.clear()
+        else:
+            self._area_rows_by_rayon.pop(rayon_norm, None)
 
     def close(self):
         if self._pg_conn is not None:
@@ -42,6 +55,7 @@ class DatabaseConnection:
                 pass
             self._pg_conn = None
         self._crm_schema_ready.clear()
+        self._area_rows_by_rayon.clear()
 
     def _pg_connect_kwargs(self) -> Dict[str, Any]:
         return {

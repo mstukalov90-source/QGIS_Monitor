@@ -23,10 +23,13 @@ from ..core.qt_compat import (
 
 
 class PasswordDialog(QDialog):
-    def __init__(self, connection_name: str, parent=None):
+    def __init__(self, connection_name: str, parent=None, *, crm_theme: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Monitor DB Loader — пароль")
         self.setModal(True)
+        if crm_theme:
+            from .crm_theme import apply_crm_theme
+            apply_crm_theme(self)
 
         layout = QVBoxLayout(self)
         hint = QLabel(
@@ -53,8 +56,8 @@ class PasswordDialog(QDialog):
         return self.password_edit.text()
 
     @staticmethod
-    def ask(connection_name: str, parent=None) -> Optional[str]:
-        dlg = PasswordDialog(connection_name, parent)
+    def ask(connection_name: str, parent=None, *, crm_theme: bool = False) -> Optional[str]:
+        dlg = PasswordDialog(connection_name, parent, crm_theme=crm_theme)
         if dialog_exec(dlg) != DIALOG_ACCEPTED:
             return None
         return dlg.get_password()

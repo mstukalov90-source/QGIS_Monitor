@@ -1,0 +1,289 @@
+# -*- coding: utf-8 -*-
+"""CRM tasks_area — площадные заказы."""
+
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+from qgis.core import QgsGeometry
+
+from .crm_tasks import TaskFeature, TaskGroup, TaskResult, TaskSubgroup, _date_filter_range
+from .crm_ui_constants import (
+    AREA_GROUP_NAME,
+    AREA_LAYER_KEY,
+    AREA_LAYER_NAME,
+    AREA_STATUS_LABELS,
+    AreaStatus,
+    normalize_rayon_name,
+)
+from .crm_task_store import _pg_connection, _pg_recover_transaction, _pg_rollback
+from .db import DatabaseConnection
+from .log_util import log_info, log_warning
+
+AreaTransitionResult = Literal["updated", "skipped", "not_found"]
+
+AreaGeometryRow = Tuple[Dict[str, Any], Optional[QgsGeometry]]
+
+
+def _geometry_from_row(geom_wkb, geom_wkt) -> Optional[QgsGeometry]:
+    if geom_wkb is not None:
+        try:
+            geom = QgsGeometry.fromWkb(bytes(geom_wkb))
+            if geom and not geom.isEmpty():
+                return geom
+        except Exception:
+            pass
+    if geom_wkt:
+        try:
+            geom = QgsGeometry.fromWkt(str(geom_wkt))
+            if geom and not geom.isEmpty():
+                return geom
+        except Exception:
+            pass
+    return None
+
+
+def _normalize_area_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(attrs)
+    key = result.get("key")
+    if key is not None:
+        result["key"] = str(key)
+    for field in ("fid", "gid", "area", "status", "rayon", "okrug", "okrug_shor"):
+        if field in result and result[field] is not None:
+            if field in ("fid", "gid"):
+                result[field] = int(result[field]) if result[field] != "" else result[field]
+            elif field == "area":
+                try:
+                    result[field] = float(result[field])
+                except (TypeError, ValueError):
+                    pass
+            else:
+                result[field] = str(result[field]).strip()
+    return result
+
+
+def _filter_rows_by_status(
+    rows: List[AreaGeometryRow], status: Optional[str]
+) -> List[AreaGeometryRow]:
+    if not status:
+        return list(rows)
+    return [
+        (attrs, geom)
+        for attrs, geom in rows
+        if (attrs.get("status") or "") == status
+    ]
+
+
+def fetch_tasks_area_geometries(
+    conn: DatabaseConnection,
+    rayon: str,
+    status: Optional[str] = None,
+    limit: int = 5000,
+) -> List[AreaGeometryRow]:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return []
+
+    rayon_norm = normalize_rayon_name(rayon)
+    filters = ['"geom" IS NOT NULL', '"rayon" = %s']
+    params: List[Any] = [rayon_norm]
+    if status:
+        filters.append('"status" = %s')
+        params.append(status)
+    params.append(limit)
+    where = " AND ".join(filters)
+
+    query = f"""
+        SELECT key, fid, gid, rayon, okrug, okrug_shor, area, status,
+               date_survey, loaded_at,
+               ST_AsBinary(geom) AS geom_wkb,
+               ST_AsText(geom) AS geom_wkt
+        FROM crm.tasks_area
+        WHERE {where}
+        ORDER BY loaded_at DESC NULLS LAST
+        LIMIT %s
+    """
+
+    rows: List[AreaGeometryRow] = []
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, params)
+            col_names = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                data = dict(zip(col_names, row))
+                geom_wkb = data.pop("geom_wkb", None)
+                geom_wkt = data.pop("geom_wkt", None)
+                attrs = _normalize_area_attrs(data)
+                geom = _geometry_from_row(geom_wkb, geom_wkt)
+                rows.append((attrs, geom))
+        pg.commit()
+        log_info(
+            f"crm.tasks_area: загружено {len(rows)} записей "
+            f"(район «{rayon_norm}», status={status or 'all'})"
+        )
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось загрузить crm.tasks_area: {exc}")
+    return rows
+
+
+def preload_area_geometries(
+    conn: DatabaseConnection, rayon: str, limit: int = 5000
+) -> int:
+    """Загрузить все полигоны района в кэш соединения (один SQL до открытия диалога)."""
+    rayon_norm = normalize_rayon_name(rayon)
+    rows = fetch_tasks_area_geometries(conn, rayon=rayon_norm, status=None, limit=limit)
+    conn.set_area_rows_cache(rayon_norm, rows)
+    log_info(f"crm.tasks_area: кэш района «{rayon_norm}» — {len(rows)} полигонов")
+    return len(rows)
+
+
+def invalidate_area_geometries_cache(
+    conn: DatabaseConnection, rayon: Optional[str] = None
+) -> None:
+    if rayon is None:
+        conn.clear_area_rows_cache()
+    else:
+        conn.clear_area_rows_cache(normalize_rayon_name(rayon))
+
+
+def get_area_geometries(
+    conn: DatabaseConnection,
+    rayon: str,
+    status: Optional[str] = None,
+    limit: int = 5000,
+) -> List[AreaGeometryRow]:
+    """Полигоны из кэша (фильтр по status in-memory) или fallback SQL."""
+    rayon_norm = normalize_rayon_name(rayon)
+    cached = conn.get_area_rows_cache(rayon_norm)
+    if cached is not None:
+        return _filter_rows_by_status(cached, status)
+
+    if status:
+        return fetch_tasks_area_geometries(
+            conn, rayon=rayon_norm, status=status, limit=limit
+        )
+
+    rows = fetch_tasks_area_geometries(
+        conn, rayon=rayon_norm, status=None, limit=limit
+    )
+    conn.set_area_rows_cache(rayon_norm, rows)
+    return rows
+
+
+def _rows_to_features(rows: List[AreaGeometryRow]) -> List[TaskFeature]:
+    features: List[TaskFeature] = []
+    for attrs, area_geom in rows:
+        task_key = str(attrs.get("key", "")).strip() or None
+        features.append(
+            TaskFeature(
+                layer=None,
+                layer_name=AREA_LAYER_NAME,
+                layer_key=AREA_LAYER_KEY,
+                feature_id=None,
+                attributes=attrs,
+                task_key=task_key,
+                area_geom=area_geom,
+            )
+        )
+    return features
+
+
+def collect_tasks_area(
+    conn: DatabaseConnection,
+    rayon: str,
+    status: AreaStatus,
+) -> TaskResult:
+    if status not in AREA_STATUS_LABELS:
+        raise ValueError(f"Unknown area status: {status}")
+
+    rows = get_area_geometries(conn, rayon=rayon, status=status)
+    features = _rows_to_features(rows)
+
+    subgroup = TaskSubgroup(
+        name=AREA_STATUS_LABELS.get(status, status),
+        features=features,
+    )
+    group = TaskGroup(name=AREA_GROUP_NAME, subgroups=[subgroup])
+
+    date_from, date_to = _date_filter_range(3)
+    return TaskResult(
+        district_name=normalize_rayon_name(rayon),
+        filter_date_from=date_from,
+        filter_date_to=date_to,
+        apply_date_filter=False,
+        groups=[group],
+        task_source=f"area_{status}",
+    )
+
+
+def send_area_to_survey(conn: DatabaseConnection, key: str) -> AreaTransitionResult:
+    return _transition_area_status(
+        conn, key, from_status=None, to_status="wip", skip_if="wip"
+    )
+
+
+def release_area_from_survey(conn: DatabaseConnection, key: str) -> AreaTransitionResult:
+    return _transition_area_status(conn, key, from_status="wip", to_status="free")
+
+
+def complete_area_survey(conn: DatabaseConnection, key: str) -> AreaTransitionResult:
+    return _transition_area_status(conn, key, from_status="wip", to_status="done")
+
+
+def _transition_area_status(
+    conn: DatabaseConnection,
+    key: str,
+    *,
+    from_status: Optional[str],
+    to_status: str,
+    skip_if: Optional[str] = None,
+) -> AreaTransitionResult:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return "not_found"
+
+    if from_status is None:
+        where = "key = %s::uuid AND COALESCE(status, '') <> %s"
+        params: tuple = (to_status, key, skip_if or to_status)
+        sql = f"""
+            UPDATE crm.tasks_area SET status = %s
+            WHERE {where}
+            RETURNING key
+        """
+    else:
+        where = "key = %s::uuid AND status = %s"
+        params = (to_status, key, from_status)
+        sql = f"""
+            UPDATE crm.tasks_area SET status = %s
+            WHERE {where}
+            RETURNING key
+        """
+
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        pg.commit()
+        if row:
+            invalidate_area_geometries_cache(conn)
+            return "updated"
+
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM crm.tasks_area WHERE key = %s::uuid",
+                (key,),
+            )
+            existing = cur.fetchone()
+        pg.commit()
+        if not existing:
+            return "not_found"
+        if skip_if and existing[0] == skip_if:
+            return "skipped"
+        if from_status and existing[0] == from_status:
+            return "skipped"
+        return "not_found"
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось обновить статус tasks_area {key}: {exc}")
+        return "not_found"

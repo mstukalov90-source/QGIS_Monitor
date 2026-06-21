@@ -106,14 +106,14 @@ def register_modeless_dialog(iface, dialog) -> None:
 
 
 def qgs_field(name: str, field_type: int):
-    """QgsField без DeprecationWarning (QGIS 3.38+: setMetaType вместо конструктора)."""
+    """QgsField без DeprecationWarning (QGIS 3.38+: setMetaType вместо setType/конструктора)."""
     from qgis.core import QgsField
 
     field = QgsField()
     field.setName(name)
-    meta_type = _QVARIANT_TO_METATYPE.get(field_type)
-    if meta_type is not None and hasattr(field, "setMetaType"):
-        field.setMetaType(meta_type)
-    else:
+    meta_type = _QVARIANT_TO_METATYPE.get(field_type, field_type)
+    if hasattr(field, "setMetaType"):
+        field.setMetaType(int(meta_type))
+    elif hasattr(field, "setType"):
         field.setType(field_type)
     return field
