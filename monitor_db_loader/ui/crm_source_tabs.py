@@ -3,15 +3,15 @@
 
 from typing import Callable, List
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
-from qgis.PyQt.QtWidgets import (
-    QHBoxLayout,
-    QPushButton,
-    QScrollArea,
-    QWidget,
-)
+from qgis.PyQt.QtCore import pyqtSignal
+from qgis.PyQt.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
-from ..core.crm_ui_constants import TASK_SOURCES, TASK_SOURCE_LABELS, TaskSource
+from ..core.crm_ui_constants import (
+    TASK_SOURCES,
+    TASK_SOURCE_LABELS,
+    TaskSource,
+    is_area_source,
+)
 from .crm_theme import style_source_tab
 
 
@@ -24,30 +24,32 @@ class TaskSourceTabs(QWidget):
         self._buttons: List[QPushButton] = []
         self._loading = False
 
-        outer = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        row_main = QHBoxLayout()
+        row_main.setContentsMargins(0, 0, 0, 0)
+        row_main.setSpacing(6)
 
-        container = QWidget()
-        self._layout = QHBoxLayout(container)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
+        row_area = QHBoxLayout()
+        row_area.setContentsMargins(0, 0, 0, 0)
+        row_area.setSpacing(6)
 
         for source in TASK_SOURCES:
             btn = QPushButton(TASK_SOURCE_LABELS[source])
             btn.setCheckable(True)
             btn.clicked.connect(self._make_handler(source))
             self._buttons.append(btn)
-            self._layout.addWidget(btn)
+            if is_area_source(source):
+                row_area.addWidget(btn)
+            else:
+                row_main.addWidget(btn)
 
-        self._layout.addStretch()
-        scroll.setWidget(container)
-        outer.addWidget(scroll)
+        row_main.addStretch()
+        row_area.addStretch()
+        outer.addLayout(row_main)
+        outer.addLayout(row_area)
         self._sync_styles()
 
     def _make_handler(self, source: TaskSource) -> Callable:
