@@ -115,6 +115,10 @@ AREA_TASK_TABLE_COLUMNS: List[TaskTableColumn] = [
     TaskTableColumn("date_survey", "Дата обследования", "date"),
 ]
 
+FIELD_OBSERVED_COLUMN = TaskTableColumn(
+    "field_observed", "Обследовано в поле", "field_observed"
+)
+
 
 def normalize_rayon_name(value: str) -> str:
     return " ".join(str(value or "").split()).strip()
@@ -182,7 +186,22 @@ def _parse_date_value(value: Any) -> Optional[QDate]:
     return None
 
 
+def format_field_observed(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        return "Да" if value else "Нет"
+    text = str(value).strip().lower()
+    if text in ("true", "t", "1", "yes", "да"):
+        return "Да"
+    if text in ("false", "f", "0", "no", "нет"):
+        return "Нет"
+    return str(value)
+
+
 def format_task_table_cell(value: Any, fmt: Optional[str] = None) -> str:
+    if fmt == "field_observed":
+        return format_field_observed(value)
     if value is None or value == "":
         return ""
     if fmt == "date":
@@ -217,18 +236,22 @@ def resolve_task_table_columns(
 ) -> List[TaskTableColumn]:
     configured = task_table_columns_for_subgroup(subgroup_name, is_area)
     if configured:
-        return list(configured)
+        cols = list(configured)
+    else:
+        names: set = set()
+        for attrs in feature_attributes_list:
+            for key in attrs:
+                if not str(key).startswith("_"):
+                    names.add(key)
+        limit = 5 if show_sent_at else 6
+        cols = [
+            TaskTableColumn(field=f, label=f)
+            for f in sorted(names)[:limit]
+        ]
 
-    names: set = set()
-    for attrs in feature_attributes_list:
-        for key in attrs:
-            if not str(key).startswith("_"):
-                names.add(key)
-    limit = 5 if show_sent_at else 6
-    return [
-        TaskTableColumn(field=f, label=f)
-        for f in sorted(names)[:limit]
-    ]
+    if not is_area and not any(c.field == "field_observed" for c in cols):
+        cols = [FIELD_OBSERVED_COLUMN] + cols
+    return cols
 
 
 def get_legal_link_fields(link_fields: List[str]) -> List[str]:

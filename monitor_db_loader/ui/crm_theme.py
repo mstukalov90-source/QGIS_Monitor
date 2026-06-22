@@ -70,6 +70,24 @@ QDialog#crmDialog QLabel#crmPickBanner {{
     font-size: 12px;
 }}
 
+QDialog#crmDialog QLabel#crmFieldObservedYes {{
+    color: {COLOR_SUCCESS};
+    background: #e8f5e9;
+    border: 2px solid {COLOR_SUCCESS};
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+}}
+
+QDialog#crmDialog QLabel#crmFieldObservedNo {{
+    color: {COLOR_ERROR};
+    background: #ffebee;
+    border: 2px solid {COLOR_ERROR};
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+}}
+
 QDialog#crmDialog QGroupBox#crmFormSection {{
     font-weight: 600;
     font-size: 13px;
@@ -287,3 +305,14 @@ def style_button(btn, style_id: str) -> None:
 
 def style_source_tab(btn, active: bool) -> None:
     btn.setObjectName("crmSourceTabActive" if active else "crmSourceTab")
+
+
+def style_field_observed_label(label, value: Optional[bool]) -> None:
+    if value is True:
+        label.setObjectName("crmFieldObservedYes")
+    elif value is False:
+        label.setObjectName("crmFieldObservedNo")
+    else:
+        label.setObjectName("crmMuted")
+    label.style().unpolish(label)
+    label.style().polish(label)

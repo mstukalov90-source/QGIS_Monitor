@@ -14,7 +14,6 @@ from qgis.gui import QgsHighlight
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -22,6 +21,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -34,6 +34,7 @@ from ..core.crm_area_map import TasksAreaMapController
 from ..core.config import crm_task_store
 from ..core.crm_snapshot_loader import collect_snapshot_tasks
 from ..core.crm_task_store import (
+    enrich_task_result_field_observed,
     fetch_task_by_key,
     fetch_task_for_feature,
     filter_sent_tasks_from_result,
@@ -59,6 +60,7 @@ from ..core.crm_ui_constants import (
     TASK_SOURCE_LABELS,
     area_status_from_source,
     format_area_order_label,
+    format_field_observed,
     format_task_table_cell,
     is_area_source,
     resolve_task_table_columns,
@@ -69,7 +71,7 @@ from ..core.district_utils import DistrictBoundary
 from ..core.layer_utils import refresh_map_canvas
 from ..core.log_util import log_warning
 from ..core.task_dxf_export import export_tasks_to_dxf, export_tasks_to_shp
-from ..core.qt_compat import BTN_OK, TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
+from ..core.qt_compat import TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
 from .crm_source_tabs import TaskSourceTabs
 from .crm_theme import apply_crm_theme, style_button
 
@@ -122,12 +124,16 @@ class TaskDialog(QDialog):
         self.setWindowTitle(f"Задачи — {result.district_name}")
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
-        self.resize(980, 620)
+        self.resize(1000, 640)
+        self.setMinimumSize(760, 480)
         apply_crm_theme(self)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
+        header.setSpacing(8)
         self._district_label = QLabel("")
         self._district_label.setTextFormat(TEXT_FORMAT_RICH)
         header.addWidget(self._district_label, stretch=1)
@@ -151,74 +157,85 @@ class TaskDialog(QDialog):
         self._source_tabs.sourceChanged.connect(self._on_source_changed)
         layout.addWidget(self._source_tabs)
 
+        expand = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         splitter = QSplitter(Qt.Horizontal)
-        layout.addWidget(splitter)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizePolicy(expand)
+        splitter.setMinimumHeight(240)
 
         self.tree = QTreeWidget()
+        self.tree.setSizePolicy(expand)
+        self.tree.setMinimumWidth(200)
         self.tree.setHeaderLabel("Группы")
+        self.tree.header().setStretchLastSection(True)
         self.tree.currentItemChanged.connect(self._on_tree_selection_changed)
         splitter.addWidget(self.tree)
 
         self.table = QTableWidget()
+        self.table.setSizePolicy(expand)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
         self.table.cellClicked.connect(self._on_row_clicked)
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         splitter.addWidget(self.table)
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter, stretch=1)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("crmMuted")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        action_row = QHBoxLayout()
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
         self.execute_btn = QPushButton(task_execute_button_label(self._task_source))
         style_button(self.execute_btn, "crmBtnPrimary")
         self.execute_btn.setEnabled(False)
         self.execute_btn.clicked.connect(self._on_execute_task)
-        action_row.addWidget(self.execute_btn)
+        footer.addWidget(self.execute_btn)
 
         self._area_send_btn = QPushButton("Отправить на полевое обследование")
         style_button(self._area_send_btn, "crmBtnPrimary")
         self._area_send_btn.hide()
         self._area_send_btn.clicked.connect(self._on_send_area_to_survey)
-        action_row.addWidget(self._area_send_btn)
+        footer.addWidget(self._area_send_btn)
 
         self._area_release_btn = QPushButton("Снять с обследования")
         self._area_release_btn.hide()
         self._area_release_btn.clicked.connect(self._on_release_area_from_survey)
-        action_row.addWidget(self._area_release_btn)
+        footer.addWidget(self._area_release_btn)
 
         self._area_complete_btn = QPushButton("Завершить обследование")
         style_button(self._area_complete_btn, "crmBtnPrimary")
         self._area_complete_btn.hide()
         self._area_complete_btn.clicked.connect(self._on_complete_area_survey)
-        action_row.addWidget(self._area_complete_btn)
+        footer.addWidget(self._area_complete_btn)
 
         self.export_dxf_btn = QPushButton("Экспорт задач в DXF")
         self.export_dxf_btn.clicked.connect(self._on_export_dxf)
-        action_row.addWidget(self.export_dxf_btn)
+        footer.addWidget(self.export_dxf_btn)
 
         self.export_shp_btn = QPushButton("Экспорт задач в SHP")
         self.export_shp_btn.clicked.connect(self._on_export_shp)
-        action_row.addWidget(self.export_shp_btn)
+        footer.addWidget(self.export_shp_btn)
 
-        action_row.addStretch()
-        layout.addLayout(action_row)
+        footer.addStretch(1)
 
-        buttons = QDialogButtonBox(BTN_OK)
-        buttons.button(BTN_OK).setText("Закрыть")
-        buttons.accepted.connect(self.close)
-        layout.addWidget(buttons)
+        self._close_btn = QPushButton("Закрыть")
+        self._close_btn.clicked.connect(self.close)
+        footer.addWidget(self._close_btn)
+        layout.addLayout(footer)
 
         self._update_header()
         if self._db_conn and self._store_cfg and self._task_source == "active":
             self._apply_snapshot_filter()
         else:
+            if self._db_conn and self._store_cfg and not self._is_area():
+                self._enrich_field_observed()
             self._populate_tree()
             self._update_status()
             self._update_action_buttons()
@@ -321,10 +338,23 @@ class TaskDialog(QDialog):
         self._area_release_btn.setEnabled(can_manage and not self._busy)
         self._area_complete_btn.setEnabled(can_manage and not self._busy)
 
+    def _enrich_field_observed(self) -> None:
+        if not self._db_conn or not self._store_cfg or self._is_area():
+            return
+        try:
+            enrich_task_result_field_observed(
+                self._result, self._db_conn, self._store_cfg
+            )
+        except Exception as exc:
+            log_warning(f"Не удалось загрузить field_observed: {exc}")
+
     def _apply_snapshot_filter(self) -> None:
         if not self._db_conn or not self._store_cfg:
             return
         filter_sent_tasks_from_result(self._result, self._db_conn, self._store_cfg)
+        self._enrich_field_observed()
+        if self._task_source == "active":
+            self._active_result = copy_task_result(self._result)
         self._populate_tree()
         self._clear_row_selection()
         if self._current_subgroup and self._current_subgroup.features:
@@ -423,6 +453,15 @@ class TaskDialog(QDialog):
         if self._area_map:
             self._area_map.clear_selection()
 
+    def _apply_table_header_resize(self) -> None:
+        header = self.table.horizontalHeader()
+        count = self.table.columnCount()
+        if count <= 0:
+            return
+        for index in range(count - 1):
+            header.setSectionResizeMode(index, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(count - 1, QHeaderView.Stretch)
+
     def _fill_table(self, subgroup: Optional[TaskSubgroup]) -> None:
         self.table.blockSignals(True)
         self.table.clear()
@@ -446,6 +485,7 @@ class TaskDialog(QDialog):
 
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
+        self._apply_table_header_resize()
         self.table.setRowCount(len(subgroup.features))
 
         for row, task_feat in enumerate(subgroup.features):
@@ -461,10 +501,15 @@ class TaskDialog(QDialog):
                 self._set_cell(row, col_idx, _format_sent_at(task_feat.sent_at))
                 col_idx += 1
             for col in self._table_columns:
-                value = task_feat.attributes.get(col.field, "")
-                self._set_cell(
-                    row, col_idx, format_task_table_cell(value, col.format)
-                )
+                if col.format == "field_observed":
+                    cell_text = format_field_observed(
+                        task_feat.attributes.get("field_observed")
+                    )
+                else:
+                    cell_text = format_task_table_cell(
+                        task_feat.attributes.get(col.field, ""), col.format
+                    )
+                self._set_cell(row, col_idx, cell_text)
                 col_idx += 1
 
         self.table.blockSignals(False)
@@ -564,7 +609,7 @@ class TaskDialog(QDialog):
             record,
             conn,
             self._store_cfg,
-            None,
+            self._iface.mainWindow() if self._iface else None,
             iface=self._iface,
             config=self._config,
             subgroup_name=self._current_subgroup.name,
@@ -677,10 +722,12 @@ class TaskDialog(QDialog):
                     filter_sent_tasks_from_result(
                         self._result, conn, self._store_cfg
                     )
+                self._enrich_field_observed()
             elif source in SNAPSHOT_SOURCES:
                 self._result = collect_snapshot_tasks(
                     conn, self._district, source, self._config
                 )
+                self._enrich_field_observed()
             else:
                 status = area_status_from_source(source)
                 if not status:
@@ -846,7 +893,7 @@ class TaskDialog(QDialog):
         dlg = cls(
             result,
             iface,
-            None,
+            parent or (iface.mainWindow() if iface else None),
             config=config,
             db_conn=db_conn,
             district=district,
@@ -854,7 +901,7 @@ class TaskDialog(QDialog):
             on_change_district=on_change_district,
         )
         register_modeless_dialog(iface, dlg)
-        show_modeless_dialog(dlg)
+        show_modeless_dialog(dlg, dlg.parent())
         return dlg
 
     def closeEvent(self, event) -> None:

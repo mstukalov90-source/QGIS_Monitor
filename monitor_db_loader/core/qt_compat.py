@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Qt5 (QGIS 3.x) / Qt6 (QGIS 4.x) compatibility shims."""
 
+import sys
+
 from qgis.PyQt.QtCore import QT_VERSION, Qt, QVariant
 from qgis.PyQt.QtWidgets import QDialog, QDialogButtonBox, QLineEdit, QMessageBox
 
@@ -19,6 +21,7 @@ except (ImportError, AttributeError):
     _QVARIANT_TO_METATYPE = {}
 
 IS_QT6 = QT_VERSION >= 0x060000
+IS_MACOS = sys.platform == "darwin"
 
 # QLabel text format
 if IS_QT6:
@@ -72,20 +75,38 @@ def dialog_exec(dialog) -> int:
     return dialog.exec_()
 
 
-def show_modeless_dialog(dialog) -> None:
+def show_modeless_dialog(dialog, parent=None) -> None:
     """Показать диалог без блокировки остального интерфейса QGIS."""
     dialog.setModal(False)
     if IS_QT6:
         dialog.setWindowModality(Qt.WindowModality.NonModal)
-        window_flag = Qt.WindowType.Window
     else:
         dialog.setWindowModality(Qt.NonModal)  # type: ignore[attr-defined]
-        window_flag = Qt.Window  # type: ignore[attr-defined]
-    flags = dialog.windowFlags()
-    dialog.setWindowFlags(flags | window_flag)
-    QDialog.show(dialog)
+
+    if parent is not None and dialog.parent() is None:
+        dialog.setParent(parent)
+
+    if IS_MACOS:
+        # На macOS отдельное окно с raise_/activateWindow сворачивает полноэкранный QGIS.
+        if IS_QT6:
+            tool_flag = Qt.WindowType.Tool
+            close_flag = Qt.WindowType.WindowCloseButtonHint
+            title_flag = Qt.WindowType.WindowTitleHint
+            dialog_flag = Qt.WindowType.Dialog
+            show_without_activating = Qt.WidgetAttribute.WA_ShowWithoutActivating
+        else:
+            tool_flag = Qt.Tool  # type: ignore[attr-defined]
+            close_flag = Qt.WindowCloseButtonHint  # type: ignore[attr-defined]
+            title_flag = Qt.WindowTitleHint  # type: ignore[attr-defined]
+            dialog_flag = Qt.Dialog  # type: ignore[attr-defined]
+            show_without_activating = Qt.WA_ShowWithoutActivating  # type: ignore[attr-defined]
+        dialog.setWindowFlags(dialog_flag | tool_flag | title_flag | close_flag)
+        dialog.setAttribute(show_without_activating, True)
+        dialog.show()
+        return
+
+    dialog.show()
     dialog.raise_()
-    dialog.activateWindow()
 
 
 def register_modeless_dialog(iface, dialog) -> None:

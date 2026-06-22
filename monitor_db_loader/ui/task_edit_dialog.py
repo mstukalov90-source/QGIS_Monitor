@@ -37,11 +37,12 @@ from ..core.crm_task_store import (
 from ..core.crm_ui_constants import (
     LEGAL_STATION_FIELDS,
     TASK_SOURCE_LABELS,
+    format_field_observed,
     get_legal_link_fields,
 )
 from ..core.db import DatabaseConnection
 from ..core.qt_compat import TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
-from .crm_theme import apply_crm_theme, style_button
+from .crm_theme import apply_crm_theme, style_button, style_field_observed_label
 from .feature_pick_tool import FeaturePickMapTool
 
 StatusAction = str
@@ -75,6 +76,19 @@ def _field_value(
     if text:
         return text
     return str(getattr(record, field_name, "") or "").strip()
+
+
+def _can_close_as_illegal(record: TaskRecord) -> bool:
+    return record.field_observed is not False
+
+
+ILLEGAL_CLOSE_REQUIRES_FIELD_SURVEY = "Не проведено полевое обследование."
+
+
+def _illegal_close_block_message(record: TaskRecord) -> Optional[str]:
+    if record.field_observed is False:
+        return ILLEGAL_CLOSE_REQUIRES_FIELD_SURVEY
+    return None
 
 
 def _get_legal_validation(
@@ -172,6 +186,12 @@ class TaskEditDialog(QDialog):
         key_label = QLabel(f"Ключ: {record.key}")
         key_label.setObjectName("crmMuted")
         outer.addWidget(key_label)
+
+        self._observed_label = QLabel(
+            f"Обследовано в поле: {format_field_observed(record.field_observed)}"
+        )
+        style_field_observed_label(self._observed_label, record.field_observed)
+        outer.addWidget(self._observed_label)
 
         self._message_label = QLabel("")
         self._message_label.setWordWrap(True)
@@ -315,6 +335,12 @@ class TaskEditDialog(QDialog):
         self._btn_illegal.clicked.connect(lambda: self._request_status("illegal"))
         status_btn_row.addWidget(self._btn_illegal)
 
+        self._illegal_hint = QLabel(ILLEGAL_CLOSE_REQUIRES_FIELD_SURVEY)
+        self._illegal_hint.setObjectName("crmError")
+        self._illegal_hint.setWordWrap(True)
+        self._illegal_hint.hide()
+        status_layout.addWidget(self._illegal_hint)
+
         self._btn_clear = QPushButton("Разрытие отсутствует")
         style_button(self._btn_clear, "crmBtnStatusClear")
         self._btn_clear.clicked.connect(lambda: self._request_status("clear"))
@@ -349,14 +375,27 @@ class TaskEditDialog(QDialog):
     def _configure_status_visibility(self) -> None:
         can_field = self._task_source == "active"
         can_legal = self._task_source in ("active", "field")
-        can_illegal = self._task_source in ("active", "field")
+        can_illegal = (
+            self._task_source in ("active", "field")
+            and _can_close_as_illegal(self._record)
+        )
         can_clear = self._task_source in ("active", "field")
         has_actions = can_field or can_legal or can_illegal or can_clear
 
         self._status_group.setVisible(has_actions and not self._is_readonly)
         self._btn_field.setVisible(can_field)
         self._btn_legal.setVisible(can_legal)
-        self._btn_illegal.setVisible(can_illegal)
+        self._btn_illegal.setVisible(self._task_source in ("active", "field"))
+        self._btn_illegal.setEnabled(can_illegal)
+        show_illegal_hint = (
+            self._task_source in ("active", "field")
+            and self._record.field_observed is False
+        )
+        self._illegal_hint.setVisible(show_illegal_hint and not self._is_readonly)
+        if show_illegal_hint:
+            self._btn_illegal.setToolTip(ILLEGAL_CLOSE_REQUIRES_FIELD_SURVEY)
+        else:
+            self._btn_illegal.setToolTip("")
         self._btn_clear.setVisible(can_clear)
         self._legal_requirements.setVisible(can_legal and not self._is_readonly)
         self._link_hint.setVisible(
@@ -426,6 +465,11 @@ class TaskEditDialog(QDialog):
                 self._show_legal_requirements = True
                 self._update_legal_highlights()
                 self._set_message(validation.message or "", error=True)
+                return
+        if action == "illegal":
+            block_msg = _illegal_close_block_message(self._record)
+            if block_msg:
+                self._set_message(block_msg, error=True)
                 return
         self._show_legal_requirements = False
         self._update_legal_highlights()
@@ -560,6 +604,7 @@ class TaskEditDialog(QDialog):
                 data["sps"],
                 data["kgs"],
                 data["station_avr"],
+                data.get("field_observed"),
             )
         )
 
@@ -584,6 +629,11 @@ class TaskEditDialog(QDialog):
     def _handle_status_action(self, action: StatusAction) -> None:
         if self._is_readonly:
             return
+        if action == "illegal":
+            block_msg = _illegal_close_block_message(self._record)
+            if block_msg:
+                self._set_message(block_msg, error=True)
+                return
         if action == "legal":
             validation = self._legal_validation()
             if not validation.is_valid:
@@ -652,11 +702,12 @@ class TaskEditDialog(QDialog):
         task_source: str = "active",
         on_finished: Optional[Callable[[int], None]] = None,
     ) -> "TaskEditDialog":
+        win_parent = parent or (iface.mainWindow() if iface else None)
         dlg = TaskEditDialog(
             record,
             conn,
             store_cfg,
-            None,
+            win_parent,
             iface=iface,
             config=config,
             subgroup_name=subgroup_name,
@@ -666,5 +717,5 @@ class TaskEditDialog(QDialog):
         if on_finished is not None:
             dlg.finished.connect(on_finished)
         register_modeless_dialog(iface, dlg)
-        show_modeless_dialog(dlg)
+        show_modeless_dialog(dlg, win_parent)
         return dlg

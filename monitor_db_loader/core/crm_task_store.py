@@ -40,6 +40,7 @@ STATION_COLUMNS = ("sps", "kgs", "station_avr")
 TASK_COLUMN_LABELS = {
     "key": "Ключ задачи",
     "type": "Тип",
+    "field_observed": "Обследовано в поле",
     "photo_uuid": "Фото ИИ (uuid)",
     "photo_lens": "Фото Объектив (external_report_id)",
     "ogh_id": "ОГХ (id)",
@@ -97,7 +98,15 @@ def _station_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
         f'ALTER TABLE "{schema}"."{table}" '
         f'ADD COLUMN IF NOT EXISTS "{col}" TEXT'
         for col in STATION_COLUMNS
+    ) + (
+        f'ALTER TABLE "{schema}"."{table}" '
+        f"ADD COLUMN IF NOT EXISTS field_observed BOOLEAN",
     )
+
+
+_TASK_SELECT_COLUMNS = ("key", "type") + TASK_ID_COLUMNS + STATION_COLUMNS + (
+    "field_observed",
+)
 
 
 def _snapshot_ddl_statements(
@@ -174,6 +183,7 @@ class TaskRecord:
     sps: Optional[str] = None
     kgs: Optional[str] = None
     station_avr: Optional[str] = None
+    field_observed: Optional[bool] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -189,10 +199,14 @@ class TaskRecord:
             "sps": self.sps,
             "kgs": self.kgs,
             "station_avr": self.station_avr,
+            "field_observed": self.field_observed,
         }
 
     @classmethod
     def from_row(cls, row: Tuple) -> "TaskRecord":
+        field_observed = None
+        if len(row) > 12 and row[12] is not None:
+            field_observed = bool(row[12])
         return cls(
             key=str(row[0]),
             type=row[1] or "",
@@ -206,6 +220,7 @@ class TaskRecord:
             sps=_normalize_id_value(row[9]) if len(row) > 9 else None,
             kgs=_normalize_id_value(row[10]) if len(row) > 10 else None,
             station_avr=_normalize_id_value(row[11]) if len(row) > 11 else None,
+            field_observed=field_observed,
         )
 
 
@@ -643,6 +658,107 @@ def fetch_task_keys_index(
     return index
 
 
+def _tasks_select_sql(store_cfg: Dict[str, Any]) -> str:
+    schema, table = _table_ref(store_cfg)
+    col_list = ", ".join(f'"{col}"' for col in _TASK_SELECT_COLUMNS)
+    return f'SELECT {col_list} FROM "{schema}"."{table}"'
+
+
+def fetch_all_field_observed(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> Dict[str, Optional[bool]]:
+    """Все field_observed из crm.tasks (key → bool|None)."""
+    schema, table = _table_ref(store_cfg)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return {}
+
+    query = f'SELECT key::text, field_observed FROM "{schema}"."{table}"'
+    result: Dict[str, Optional[bool]] = {}
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query)
+            for row in cur.fetchall():
+                key = str(row[0])
+                result[key] = bool(row[1]) if row[1] is not None else None
+        pg.commit()
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось загрузить field_observed из crm.tasks: {exc}")
+    return result
+
+
+def fetch_field_observed_by_keys(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    keys: Set[str],
+) -> Dict[str, Optional[bool]]:
+    """field_observed из crm.tasks по списку key (для snapshot и активных задач)."""
+    if not keys:
+        return {}
+
+    schema, table = _table_ref(store_cfg)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return {}
+
+    key_list = [k for k in keys if k]
+    if not key_list:
+        return {}
+
+    placeholders = ", ".join(["%s::uuid"] * len(key_list))
+    query = (
+        f'SELECT key::text, field_observed FROM "{schema}"."{table}" '
+        f"WHERE key IN ({placeholders})"
+    )
+    result: Dict[str, Optional[bool]] = {}
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, tuple(key_list))
+            for row in cur.fetchall():
+                key = str(row[0])
+                result[key] = bool(row[1]) if row[1] is not None else None
+        pg.commit()
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось загрузить field_observed из crm.tasks: {exc}")
+    return result
+
+
+def enrich_task_result_field_observed(
+    task_result,
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> None:
+    """Заполнить attributes['field_observed'] и task_key для списков заказов."""
+    from .crm_ui_constants import AREA_LAYER_KEY
+
+    task_index = fetch_task_keys_index(conn, store_cfg)
+    observed_map = fetch_all_field_observed(conn, store_cfg)
+
+    for group in task_result.groups:
+        for subgroup in group.subgroups:
+            for feat in subgroup.features:
+                if feat.layer_key == AREA_LAYER_KEY:
+                    continue
+                key = feat.task_key
+                if not key:
+                    lookup = resolve_task_lookup(
+                        subgroup.name, feat.attributes, store_cfg
+                    )
+                    if lookup:
+                        key = task_index.get(lookup)
+                        if key:
+                            feat.task_key = key
+                if not key:
+                    continue
+                if key in observed_map:
+                    feat.attributes["field_observed"] = observed_map[key]
+
+
 def filter_sent_tasks_from_result(
     task_result,
     conn: DatabaseConnection,
@@ -782,9 +898,7 @@ def fetch_task(
     if pg is None:
         return None
 
-    columns = ", ".join(
-        f'"{col}"' for col in ("key", "type") + TASK_ID_COLUMNS + STATION_COLUMNS
-    )
+    columns = ", ".join(f'"{col}"' for col in _TASK_SELECT_COLUMNS)
     query = (
         f'SELECT {columns} FROM "{schema}"."{table}" '
         f'WHERE "{task_column}" = %s LIMIT 1'
@@ -813,9 +927,7 @@ def fetch_task_by_key(
     if pg is None:
         return None
 
-    columns = ", ".join(
-        f'"{col}"' for col in ("key", "type") + TASK_ID_COLUMNS + STATION_COLUMNS
-    )
+    columns = ", ".join(f'"{col}"' for col in _TASK_SELECT_COLUMNS)
     query = f'SELECT {columns} FROM "{schema}"."{table}" WHERE key = %s LIMIT 1'
     _pg_recover_transaction(pg)
     try:
