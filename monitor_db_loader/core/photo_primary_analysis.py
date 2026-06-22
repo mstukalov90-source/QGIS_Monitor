@@ -21,6 +21,7 @@ from qgis.PyQt.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from ..ui.district_dialog import DistrictDialog
 from .config import photo_primary_analysis
+from .auth import UserSession, allowed_rayons_set, filter_rayons_on_layer
 from .district_utils import (
     WGS84,
     DistrictBoundary,
@@ -416,7 +417,13 @@ def _remove_result_group(group_name: str) -> None:
         project.removeMapLayer(lid)
 
 
-def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> AnalysisResult:
+def run_primary_analysis(
+    config: Dict[str, Any],
+    iface,
+    parent=None,
+    user_session=None,
+    db_conn=None,
+) -> AnalysisResult:
     """Запуск первичного анализа фото. Возвращает статистику."""
     cfg = photo_primary_analysis(config)
     if not cfg:
@@ -456,16 +463,36 @@ def run_primary_analysis(config: Dict[str, Any], iface, parent=None) -> Analysis
         )
         return AnalysisResult(errors=[boundaries_field])
 
-    if not DistrictDialog.list_rayons(boundaries_layer, boundaries_field):
+    allowed_rayons = None
+    if user_session is not None:
+        allowed_rayons = allowed_rayons_set(db_conn, user_session)
+        if allowed_rayons is None:
+            allowed_rayons = None
+        elif not allowed_rayons and db_conn is None:
+            rayons = filter_rayons_on_layer(
+                boundaries_layer, boundaries_field, user_session
+            )
+            allowed_rayons = set(rayons) if rayons else set()
+
+    if not DistrictDialog.list_rayons(
+        boundaries_layer, boundaries_field, allowed_rayons
+    ):
         QMessageBox.warning(
             parent or iface.mainWindow(),
             "Monitor DB Loader — первичный анализ",
-            f"В слое «{boundaries_name}» нет значений в поле «{boundaries_field}».",
+            (
+                f"Нет доступных районов в слое «{boundaries_name}»."
+                if allowed_rayons is not None
+                else f"В слое «{boundaries_name}» нет значений в поле «{boundaries_field}»."
+            ),
         )
         return AnalysisResult(errors=["Нет районов"])
 
     rayon = DistrictDialog.choose(
-        boundaries_layer, boundaries_field, parent or iface.mainWindow()
+        boundaries_layer,
+        boundaries_field,
+        parent or iface.mainWindow(),
+        allowed_rayons=allowed_rayons,
     )
     if rayon is None:
         log_info("Первичный анализ фото: отменён пользователем")

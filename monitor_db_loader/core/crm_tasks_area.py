@@ -14,13 +14,37 @@ from .crm_ui_constants import (
     AreaStatus,
     normalize_rayon_name,
 )
-from .crm_task_store import _pg_connection, _pg_recover_transaction, _pg_rollback
+from .crm_task_store import (
+    _pg_connection,
+    _pg_recover_transaction,
+    _pg_rollback,
+    ensure_user_audit_columns,
+    make_user_audit,
+)
 from .db import DatabaseConnection
 from .log_util import log_info, log_warning
 
 AreaTransitionResult = Literal["updated", "skipped", "not_found"]
 
 AreaGeometryRow = Tuple[Dict[str, Any], Optional[QgsGeometry]]
+
+TASKS_AREA_SCHEMA = "crm"
+TASKS_AREA_TABLE = "tasks_area"
+
+
+def ensure_tasks_area_audit_columns(conn: DatabaseConnection) -> bool:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+    _pg_recover_transaction(pg)
+    try:
+        ensure_user_audit_columns(pg, TASKS_AREA_SCHEMA, TASKS_AREA_TABLE)
+        pg.commit()
+        return True
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось добавить audit-столбцы в crm.tasks_area: {exc}")
+        return False
 
 
 def _geometry_from_row(geom_wkb, geom_wkt) -> Optional[QgsGeometry]:
@@ -216,24 +240,35 @@ def collect_tasks_area(
     )
 
 
-def send_area_to_survey(conn: DatabaseConnection, key: str) -> AreaTransitionResult:
+def send_area_to_survey(
+    conn: DatabaseConnection, key: str, login: str
+) -> AreaTransitionResult:
     return _transition_area_status(
-        conn, key, from_status=None, to_status="wip", skip_if="wip"
+        conn, key, login=login, from_status=None, to_status="wip", skip_if="wip"
     )
 
 
-def release_area_from_survey(conn: DatabaseConnection, key: str) -> AreaTransitionResult:
-    return _transition_area_status(conn, key, from_status="wip", to_status="free")
+def release_area_from_survey(
+    conn: DatabaseConnection, key: str, login: str
+) -> AreaTransitionResult:
+    return _transition_area_status(
+        conn, key, login=login, from_status="wip", to_status="free"
+    )
 
 
-def complete_area_survey(conn: DatabaseConnection, key: str) -> AreaTransitionResult:
-    return _transition_area_status(conn, key, from_status="wip", to_status="done")
+def complete_area_survey(
+    conn: DatabaseConnection, key: str, login: str
+) -> AreaTransitionResult:
+    return _transition_area_status(
+        conn, key, login=login, from_status="wip", to_status="done"
+    )
 
 
 def _transition_area_status(
     conn: DatabaseConnection,
     key: str,
     *,
+    login: str,
     from_status: Optional[str],
     to_status: str,
     skip_if: Optional[str] = None,
@@ -242,19 +277,34 @@ def _transition_area_status(
     if pg is None:
         return "not_found"
 
+    ensure_tasks_area_audit_columns(conn)
+    audit = make_user_audit(login)
+
     if from_status is None:
         where = "key = %s::uuid AND COALESCE(status, '') <> %s"
-        params: tuple = (to_status, key, skip_if or to_status)
+        params: tuple = (
+            to_status,
+            audit,
+            audit,
+            key,
+            skip_if or to_status,
+        )
         sql = f"""
-            UPDATE crm.tasks_area SET status = %s
+            UPDATE crm.tasks_area SET
+                status = %s,
+                user_last_edit = %s::text[],
+                user_created = COALESCE(user_created, %s::text[])
             WHERE {where}
             RETURNING key
         """
     else:
         where = "key = %s::uuid AND status = %s"
-        params = (to_status, key, from_status)
+        params = (to_status, audit, audit, key, from_status)
         sql = f"""
-            UPDATE crm.tasks_area SET status = %s
+            UPDATE crm.tasks_area SET
+                status = %s,
+                user_last_edit = %s::text[],
+                user_created = COALESCE(user_created, %s::text[])
             WHERE {where}
             RETURNING key
         """

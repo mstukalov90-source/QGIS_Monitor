@@ -2,12 +2,14 @@
 """Main plugin class for Monitor DB Loader."""
 
 import os
+from typing import Optional
 
 from qgis.core import QgsMessageLog, Qgis
 from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 
+from .core.auth import DB_PASSWORD, UserSession, authenticate
 from .core.config import (
     LOG_CHANNEL,
     database_connection,
@@ -20,8 +22,7 @@ from .core.layer_utils import refresh_map_canvas, zoom_map_to_layers
 from .core.log_util import log_info
 from .core.crm_tasks import run_get_task
 from .core.photo_primary_analysis import run_primary_analysis
-from .core.qt_compat import MSGBOX_CANCEL, MSGBOX_RETRY
-from .ui.password_dialog import PasswordDialog
+from .ui.login_dialog import LoginDialog
 
 
 class MonitorDbLoader:
@@ -36,6 +37,7 @@ class MonitorDbLoader:
         self._config = None
         self._loaded_layer_ids = []
         self._loaded_group_names = []
+        self._user_session: Optional[UserSession] = None
 
     def initGui(self):
         icon_path = os.path.join(self.plugin_dir, "icon.png")
@@ -87,85 +89,126 @@ class MonitorDbLoader:
             self.iface.removeToolBarIcon(self.action)
             del self.action
 
+    def _ensure_config(self) -> bool:
+        if self._config is not None:
+            return True
+        try:
+            self._config = load_config()
+            return True
+        except Exception as exc:
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "Monitor DB Loader",
+                f"Не удалось загрузить конфигурацию:\n{exc}",
+            )
+            return False
+
+    def _db_connection(self) -> Optional[DatabaseConnection]:
+        if not self._ensure_config():
+            return None
+        db_cfg = database_connection(self._config)
+        conn = DatabaseConnection(db_cfg, DB_PASSWORD)
+        ok, err = conn.test_connection()
+        if ok:
+            return conn
+        conn.close()
+        QMessageBox.critical(
+            self.iface.mainWindow(),
+            "Monitor DB Loader — ошибка подключения",
+            f"Не удалось подключиться к базе данных:\n{err}",
+        )
+        return None
+
+    def _ensure_session(self) -> Optional[UserSession]:
+        if self._user_session is not None:
+            return self._user_session
+        if not self._ensure_config():
+            return None
+
+        parent = self.iface.mainWindow()
+        while True:
+            creds = LoginDialog.ask(parent)
+            if creds is None:
+                return None
+            login, password = creds
+
+            conn = self._db_connection()
+            if conn is None:
+                return None
+
+            session = authenticate(conn, login, password)
+            conn.close()
+            if session is not None:
+                self._user_session = session
+                log_info(f"Вход выполнен: {session.login} (роль {session.role})")
+                return session
+
+            QMessageBox.warning(
+                parent,
+                "Monitor DB Loader — вход",
+                "Неверный логин или пароль.",
+            )
+
     def run_primary_analysis(self):
-        if self._config is None:
-            try:
-                self._config = load_config()
-            except Exception as exc:
-                QMessageBox.critical(
-                    self.iface.mainWindow(),
-                    "Monitor DB Loader",
-                    f"Не удалось загрузить конфигурацию:\n{exc}",
-                )
-                return
+        if not self._ensure_config():
+            return
+        session = self._ensure_session()
+        if session is None:
+            return
 
         log_info("Запуск первичного анализа фото…")
-        run_primary_analysis(self._config, self.iface, self.iface.mainWindow())
+        db_conn = self._db_connection()
+        try:
+            run_primary_analysis(
+                self._config,
+                self.iface,
+                self.iface.mainWindow(),
+                user_session=session,
+                db_conn=db_conn,
+            )
+        finally:
+            if db_conn is not None:
+                db_conn.close()
 
     def run_get_task(self):
-        if self._config is None:
-            try:
-                self._config = load_config()
-            except Exception as exc:
-                QMessageBox.critical(
-                    self.iface.mainWindow(),
-                    "Monitor DB Loader",
-                    f"Не удалось загрузить конфигурацию:\n{exc}",
-                )
-                return
+        if not self._ensure_config():
+            return
+        session = self._ensure_session()
+        if session is None:
+            return
 
         log_info("Запуск «Получить задачу»…")
-        run_get_task(self._config, self.iface, self.iface.mainWindow())
+        db_conn = self._db_connection()
+        run_get_task(
+            self._config,
+            self.iface,
+            self.iface.mainWindow(),
+            user_session=session,
+            db_conn=db_conn,
+        )
 
     def run(self):
-        if self._config is None:
-            try:
-                self._config = load_config()
-            except Exception as exc:
-                QMessageBox.critical(
-                    self.iface.mainWindow(),
-                    "Monitor DB Loader",
-                    f"Не удалось загрузить конфигурацию:\n{exc}",
-                )
-                return
+        if not self._ensure_config():
+            return
+        session = self._ensure_session()
+        if session is None:
+            return
 
-        db_cfg = database_connection(self._config)
-        connection_name = db_cfg.get("connection_name", "Monitor DB Connection")
-
-        while True:
-            password = PasswordDialog.ask(
-                connection_name, self.iface.mainWindow()
-            )
-            if password is None:
-                return
-
-            conn = DatabaseConnection(db_cfg, password)
-            ok, err = conn.test_connection()
-            if ok:
-                break
-
-            conn.close()
-            reply = QMessageBox.critical(
-                self.iface.mainWindow(),
-                "Monitor DB Loader — ошибка подключения",
-                f"Не удалось подключиться к базе данных:\n{err}",
-                MSGBOX_RETRY | MSGBOX_CANCEL,
-                MSGBOX_RETRY,
-            )
-            if reply != MSGBOX_RETRY:
-                return
+        conn = self._db_connection()
+        if conn is None:
+            return
 
         try:
             log_info("Запуск загрузки Monitor DB Loader…")
             if self._loaded_layer_ids or self._loaded_group_names:
-                loader_cleanup = LayerLoader(self._config, conn)
+                loader_cleanup = LayerLoader(self._config, conn, session)
                 loader_cleanup.remove_previous_layers(
                     self._loaded_layer_ids, self._loaded_group_names
                 )
                 self._loaded_layer_ids = []
                 self._loaded_group_names = []
 
-            loader = LayerLoader(self._config, conn)
+            loader = LayerLoader(self._config, conn, session)
             result = loader.load_all()
             self._loaded_layer_ids = result.layer_ids
             self._loaded_group_names = result.group_names

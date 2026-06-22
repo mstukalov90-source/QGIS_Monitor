@@ -2,10 +2,12 @@
 """Load vector layers into the QGIS project with grouping."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from qgis.core import QgsMessageLog, QgsProject, QgsVectorLayer, Qgis
 from qgis.PyQt.QtWidgets import QMessageBox
+
+from .auth import UserSession, apply_hood_filter_to_layer_def
 
 from .config import (
     LOG_CHANNEL,
@@ -31,9 +33,15 @@ class LoadResult:
 
 
 class LayerLoader:
-    def __init__(self, config: Dict[str, Any], connection: DatabaseConnection):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        connection: DatabaseConnection,
+        user_session: Optional[UserSession] = None,
+    ):
         self.config = config
         self.connection = connection
+        self.user_session = user_session
         self.project = QgsProject.instance()
         self.root = self.project.layerTreeRoot()
 
@@ -104,6 +112,7 @@ class LayerLoader:
 
     def _load_single(self, layer_def: Dict[str, Any], group_node, result: LoadResult):
         display_name = layer_def.get("display_name", layer_def.get("table_name", ""))
+        layer_def = apply_hood_filter_to_layer_def(layer_def, self.user_session)
 
         if layer_def.get("placeholder"):
             layer = self._create_placeholder_layer(layer_def, display_name)

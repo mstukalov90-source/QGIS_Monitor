@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Вкладки источников задач CRM."""
 
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
@@ -18,11 +18,15 @@ from .crm_theme import style_source_tab
 class TaskSourceTabs(QWidget):
     sourceChanged = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, allowed_sources: Optional[List[TaskSource]] = None):
         super().__init__(parent)
         self._value: TaskSource = "active"
         self._buttons: List[QPushButton] = []
+        self._source_by_button: dict = {}
         self._loading = False
+        self._allowed_sources = (
+            list(allowed_sources) if allowed_sources is not None else list(TASK_SOURCES)
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -41,6 +45,7 @@ class TaskSourceTabs(QWidget):
             btn.setCheckable(True)
             btn.clicked.connect(self._make_handler(source))
             self._buttons.append(btn)
+            self._source_by_button[btn] = source
             if is_area_source(source):
                 row_area.addWidget(btn)
             else:
@@ -50,7 +55,19 @@ class TaskSourceTabs(QWidget):
         row_area.addStretch()
         outer.addLayout(row_main)
         outer.addLayout(row_area)
+        self.set_allowed_sources(self._allowed_sources)
         self._sync_styles()
+
+    def set_allowed_sources(self, sources: List[TaskSource]) -> None:
+        self._allowed_sources = list(sources)
+        allowed = set(self._allowed_sources)
+        for btn, src in self._source_by_button.items():
+            visible = src in allowed
+            btn.setVisible(visible)
+            if not visible and btn.isChecked():
+                btn.setChecked(False)
+        if self._value not in allowed and self._allowed_sources:
+            self.set_value(self._allowed_sources[0])
 
     def _make_handler(self, source: TaskSource) -> Callable:
         def handler(checked: bool = False) -> None:
@@ -62,8 +79,10 @@ class TaskSourceTabs(QWidget):
         return handler
 
     def set_value(self, source: str) -> None:
+        if source not in self._allowed_sources:
+            return
         self._value = source  # type: ignore[assignment]
-        for btn, src in zip(self._buttons, TASK_SOURCES):
+        for btn, src in self._source_by_button.items():
             btn.setChecked(src == source)
         self._sync_styles()
 
@@ -73,8 +92,10 @@ class TaskSourceTabs(QWidget):
     def set_loading(self, loading: bool) -> None:
         self._loading = loading
         for btn in self._buttons:
-            btn.setEnabled(not loading)
+            if btn.isVisible():
+                btn.setEnabled(not loading)
 
     def _sync_styles(self) -> None:
-        for btn, src in zip(self._buttons, TASK_SOURCES):
-            style_source_tab(btn, src == self._value)
+        for btn, src in self._source_by_button.items():
+            if btn.isVisible():
+                style_source_tab(btn, src == self._value)

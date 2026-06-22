@@ -25,6 +25,7 @@ from .crm_tasks_area import get_area_geometries
 from .crm_ui_constants import normalize_rayon_name
 from .db import DatabaseConnection
 from .layer_utils import refresh_map_canvas
+from .qt_compat import detach_rubber_band
 from .qt_compat import qgs_field
 
 AREA_GROUP_NAME = "Monitor CRM — площадные"
@@ -249,7 +250,7 @@ class TasksAreaMapController:
     def clear(self) -> None:
         self.clear_selection()
         if self._selection_band is not None:
-            self._selection_band.setCanvas(None)
+            detach_rubber_band(self._selection_band)
             self._selection_band = None
         self._clear_layers()
         root = QgsProject.instance().layerTreeRoot()

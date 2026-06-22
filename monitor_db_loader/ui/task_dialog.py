@@ -43,9 +43,10 @@ from ..core.crm_tasks import (
     TaskFeature,
     TaskResult,
     TaskSubgroup,
-    _connect_with_password,
+    connect_db,
     copy_task_result,
 )
+from ..core.auth import UserSession, allowed_task_sources
 from ..core.crm_tasks_area import (
     collect_tasks_area,
     complete_area_survey,
@@ -57,6 +58,7 @@ from ..core.crm_tasks_area import (
 from ..core.crm_ui_constants import (
     AREA_STATUS_LABELS,
     SNAPSHOT_SOURCES,
+    TASK_SOURCES,
     TASK_SOURCE_LABELS,
     area_status_from_source,
     format_area_order_label,
@@ -96,6 +98,7 @@ class TaskDialog(QDialog):
         district: Optional[DistrictBoundary] = None,
         apply_date_filter: bool = True,
         on_change_district=None,
+        user_session: Optional[UserSession] = None,
     ):
         super().__init__(parent)
         self._result = result
@@ -103,12 +106,20 @@ class TaskDialog(QDialog):
         self._iface = iface
         self._config = config
         self._db_conn = db_conn
-        self._own_db_conn = False
+        self._own_db_conn = db_conn is not None
+        self._user_session = user_session
+        self._allowed_sources = (
+            allowed_task_sources(user_session.role)
+            if user_session
+            else list(TASK_SOURCES)
+        )
         self._store_cfg = crm_task_store(config) if config else {}
         self._district = district
         self._apply_date_filter = apply_date_filter
         self._on_change_district = on_change_district
-        self._task_source = result.task_source or "active"
+        self._task_source = result.task_source or (
+            self._allowed_sources[0] if self._allowed_sources else "active"
+        )
         self._highlight: Optional[QgsHighlight] = None
         self._current_group_name = ""
         self._current_subgroup: Optional[TaskSubgroup] = None
@@ -152,7 +163,7 @@ class TaskDialog(QDialog):
         self._meta_label.setObjectName("crmMuted")
         layout.addWidget(self._meta_label)
 
-        self._source_tabs = TaskSourceTabs()
+        self._source_tabs = TaskSourceTabs(allowed_sources=self._allowed_sources)
         self._source_tabs.set_value(self._task_source)
         self._source_tabs.sourceChanged.connect(self._on_source_changed)
         layout.addWidget(self._source_tabs)
@@ -231,7 +242,13 @@ class TaskDialog(QDialog):
         layout.addLayout(footer)
 
         self._update_header()
-        if self._db_conn and self._store_cfg and self._task_source == "active":
+        if (
+            self._task_source != "active"
+            and self._db_conn
+            and self._district
+        ):
+            QTimer.singleShot(0, lambda: self._reload_for_source(self._task_source))
+        elif self._db_conn and self._store_cfg and self._task_source == "active":
             self._apply_snapshot_filter()
         else:
             if self._db_conn and self._store_cfg and not self._is_area():
@@ -327,6 +344,8 @@ class TaskDialog(QDialog):
         )
 
     def _update_area_buttons(self) -> None:
+        if not self._is_area():
+            return
         feat = self._selected_task_feat
         status = str(feat.attributes.get("status", "")) if feat else ""
         can_send = bool(feat) and status != "wip"
@@ -559,7 +578,7 @@ class TaskDialog(QDialog):
             return self._db_conn
         if not self._config:
             return None
-        conn = _connect_with_password(self._config, self)
+        conn = connect_db(self._config)
         if conn is not None:
             self._db_conn = conn
             self._own_db_conn = True
@@ -616,7 +635,13 @@ class TaskDialog(QDialog):
             group_name=self._current_group_name,
             task_source=self._task_source,
             on_finished=_on_edit_closed,
+            user_login=self._current_user_login(),
         )
+
+    def _current_user_login(self) -> str:
+        if self._user_session is not None:
+            return self._user_session.login
+        return ""
 
     def _area_task_key(self) -> Optional[str]:
         if not self._selected_task_feat:
@@ -634,7 +659,7 @@ class TaskDialog(QDialog):
         self._busy = True
         self._update_action_buttons()
         try:
-            result = fn(conn, key)
+            result = fn(conn, key, self._current_user_login())
             if result == "updated":
                 self.status_label.setText(success_msg)
                 invalidate_area_geometries_cache(conn, self._result.district_name)
@@ -681,9 +706,15 @@ class TaskDialog(QDialog):
         self._reload_for_source(self._task_source)
 
     def _on_source_changed(self, source: str) -> None:
+        if source not in self._allowed_sources:
+            self._source_tabs.set_value(self._task_source)
+            return
         self._reload_for_source(source)
 
     def _reload_for_source(self, source: str) -> None:
+        if source not in self._allowed_sources:
+            self._source_tabs.set_value(self._task_source)
+            return
         self._source_tabs.set_loading(True)
         if not self._config or not self._district:
             if source == "active":
@@ -889,6 +920,7 @@ class TaskDialog(QDialog):
         district: Optional[DistrictBoundary] = None,
         apply_date_filter: bool = True,
         on_change_district=None,
+        user_session: Optional[UserSession] = None,
     ) -> "TaskDialog":
         dlg = cls(
             result,
@@ -899,6 +931,7 @@ class TaskDialog(QDialog):
             district=district,
             apply_date_filter=apply_date_filter,
             on_change_district=on_change_district,
+            user_session=user_session,
         )
         register_modeless_dialog(iface, dlg)
         show_modeless_dialog(dlg, dlg.parent())
@@ -907,6 +940,9 @@ class TaskDialog(QDialog):
     def closeEvent(self, event) -> None:
         self._clear_highlight()
         if self._area_map:
-            self._area_map.clear()
+            try:
+                self._area_map.clear()
+            except Exception:
+                pass
         self._close_db_conn()
         super().closeEvent(event)

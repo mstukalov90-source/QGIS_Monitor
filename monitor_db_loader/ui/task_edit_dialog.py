@@ -134,11 +134,13 @@ class TaskEditDialog(QDialog):
         subgroup_name: Optional[str] = None,
         group_name: Optional[str] = None,
         task_source: str = "active",
+        user_login: str = "",
     ):
         super().__init__(parent)
         self._record = record
         self._conn = conn
         self._store_cfg = store_cfg
+        self._user_login = user_login or ""
         self._iface = iface
         self._config = config
         self._subgroup_name = subgroup_name
@@ -612,7 +614,9 @@ class TaskEditDialog(QDialog):
         self._cancel_pick(silent=True)
         updated = self._record_from_form()
         try:
-            update_task_record(self._conn, updated, self._store_cfg)
+            update_task_record(
+                self._conn, updated, self._store_cfg, self._user_login
+            )
         except ValueError as exc:
             self._set_message(str(exc), error=True)
             return
@@ -653,8 +657,10 @@ class TaskEditDialog(QDialog):
 
         self._set_busy(True)
         try:
-            update_task_record(self._conn, updated, self._store_cfg)
-            result = send_fn(self._conn, updated, self._store_cfg)
+            update_task_record(
+                self._conn, updated, self._store_cfg, self._user_login
+            )
+            result = send_fn(self._conn, updated, self._store_cfg, self._user_login)
         except ValueError as exc:
             self._set_message(str(exc), error=True)
             return
@@ -701,6 +707,7 @@ class TaskEditDialog(QDialog):
         group_name: Optional[str] = None,
         task_source: str = "active",
         on_finished: Optional[Callable[[int], None]] = None,
+        user_login: str = "",
     ) -> "TaskEditDialog":
         win_parent = parent or (iface.mainWindow() if iface else None)
         dlg = TaskEditDialog(
@@ -713,6 +720,7 @@ class TaskEditDialog(QDialog):
             subgroup_name=subgroup_name,
             group_name=group_name,
             task_source=task_source,
+            user_login=user_login,
         )
         if on_finished is not None:
             dlg.finished.connect(on_finished)

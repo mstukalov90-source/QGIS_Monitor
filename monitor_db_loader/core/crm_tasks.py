@@ -16,7 +16,13 @@ from qgis.PyQt.QtCore import QDate, QDateTime
 from qgis.PyQt.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from ..ui.district_dialog import DistrictDialog
-from ..ui.password_dialog import PasswordDialog
+from .auth import (
+    DB_PASSWORD,
+    UserSession,
+    allowed_rayons_set,
+    default_task_source,
+    filter_rayons_on_layer,
+)
 from .config import crm_task_store, crm_tasks, database_connection
 from .crm_task_store import ensure_all_snapshot_tables, persist_task_result
 from .db import DatabaseConnection
@@ -28,7 +34,6 @@ from .district_utils import (
     resolve_layers,
 )
 from .log_util import log_info, log_warning
-from .qt_compat import MSGBOX_CANCEL, MSGBOX_RETRY
 
 
 @dataclass
@@ -311,46 +316,37 @@ def _build_task_result(
     return result, False
 
 
-def _connect_with_password(config: Dict[str, Any], parent) -> Optional[DatabaseConnection]:
-    """Запросить пароль и вернуть подключение к БД."""
+def connect_db(config: Dict[str, Any]) -> Optional[DatabaseConnection]:
+    """Подключение к PostgreSQL с фиксированным паролем после авторизации."""
     db_cfg = database_connection(config)
-    connection_name = db_cfg.get("connection_name", "Monitor DB Connection")
-
-    while True:
-        password = PasswordDialog.ask(connection_name, parent, crm_theme=True)
-        if password is None:
-            return None
-
-        conn = DatabaseConnection(db_cfg, password)
-        ok, err = conn.test_connection()
-        if ok:
-            return conn
-
-        conn.close()
-        reply = QMessageBox.critical(
-            parent,
-            "Monitor DB Loader — ошибка подключения",
-            f"Не удалось подключиться к базе данных:\n{err}",
-            MSGBOX_RETRY | MSGBOX_CANCEL,
-            MSGBOX_RETRY,
-        )
-        if reply != MSGBOX_RETRY:
-            return None
+    conn = DatabaseConnection(db_cfg, DB_PASSWORD)
+    ok, err = conn.test_connection()
+    if ok:
+        return conn
+    conn.close()
+    log_warning(f"Подключение к БД не удалось: {err}")
+    return None
 
 
 def _persist_tasks_to_db(
     config: Dict[str, Any],
     task_result: TaskResult,
     parent,
+    db_conn: Optional[DatabaseConnection] = None,
+    user_session: Optional[UserSession] = None,
 ) -> Optional[DatabaseConnection]:
     store_cfg = crm_task_store(config)
     if not store_cfg:
         log_warning("Секция crm_tasks.task_store отсутствует — запись в БД пропущена")
-        return None
+        return db_conn
 
-    conn = _connect_with_password(config, parent)
+    conn = db_conn
+    own_conn = False
     if conn is None:
-        log_info("Подключение к БД отменено (пароль не введён)")
+        conn = connect_db(config)
+        own_conn = True
+    if conn is None:
+        log_info("Подключение к БД недоступно")
         return None
 
     if not ensure_all_snapshot_tables(conn, store_cfg):
@@ -366,10 +362,13 @@ def _persist_tasks_to_db(
         )
         return conn
 
+    login = user_session.login if user_session else ""
+
     try:
-        stats = persist_task_result(conn, task_result, store_cfg)
+        stats = persist_task_result(conn, task_result, store_cfg, login)
     except Exception as exc:
-        conn.close()
+        if own_conn:
+            conn.close()
         QMessageBox.warning(
             parent,
             "Monitor DB Loader — задачи",
@@ -399,10 +398,18 @@ def _persist_tasks_to_db(
             f"Не удалось сохранить задачи в crm.tasks:\n"
             f"• Без ID (нет поля-идентификатора): {stats.invalid}",
         )
+    if own_conn:
+        return conn
     return conn
 
 
-def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
+def run_get_task(
+    config: Dict[str, Any],
+    iface,
+    parent=None,
+    user_session: Optional[UserSession] = None,
+    db_conn: Optional[DatabaseConnection] = None,
+) -> TaskResult:
     """Запуск сбора задач CRM по выбранному району."""
     today = QDate.currentDate()
     empty_result = TaskResult(
@@ -457,11 +464,28 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
             errors=[boundaries_field],
         )
 
-    if not DistrictDialog.list_rayons(boundaries_layer, boundaries_field):
+    allowed_rayons = None
+    if user_session is not None:
+        allowed_rayons = allowed_rayons_set(db_conn, user_session)
+        if allowed_rayons is None:
+            allowed_rayons = None
+        elif not allowed_rayons and db_conn is None:
+            rayons = filter_rayons_on_layer(
+                boundaries_layer, boundaries_field, user_session
+            )
+            allowed_rayons = set(rayons) if rayons else set()
+
+    if not DistrictDialog.list_rayons(
+        boundaries_layer, boundaries_field, allowed_rayons
+    ):
         QMessageBox.warning(
             parent or iface.mainWindow(),
             "Monitor DB Loader — получить задачу",
-            f"В слое «{boundaries_name}» нет значений в поле «{boundaries_field}».",
+            (
+                f"Нет доступных районов в слое «{boundaries_name}»."
+                if allowed_rayons is not None
+                else f"В слое «{boundaries_name}» нет значений в поле «{boundaries_field}»."
+            ),
         )
         return TaskResult(
             district_name="",
@@ -476,6 +500,7 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
         parent or iface.mainWindow(),
         date_from=date_from,
         date_to=date_to,
+        allowed_rayons=allowed_rayons,
     )
     if choice is None:
         log_info("Получить задачу: отменено пользователем")
@@ -515,42 +540,66 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
         )
     )
 
-    groups_cfg = cfg.get("groups", [])
-    total_steps = sum(len(g.get("subgroups", [])) for g in groups_cfg)
-    progress = QProgressDialog(
-        "Подготовка…",
-        "Отмена",
-        0,
-        max(total_steps, 1),
-        parent or iface.mainWindow(),
-    )
-    progress.setWindowTitle("Monitor CRM")
-    progress.setMinimumDuration(0)
-    progress.setValue(0)
+    role = user_session.role if user_session else "manager"
+    initial_source = default_task_source(role)
+    field_only = role == "field"
 
-    task_result, canceled = _build_task_result(
-        cfg,
-        district,
-        metric_crs,
-        root,
-        date_from,
-        date_to,
-        apply_date_filter,
-        progress,
-    )
-    progress.close()
+    if field_only:
+        task_result = TaskResult(
+            district_name=district.name,
+            filter_date_from=date_from,
+            filter_date_to=date_to,
+            apply_date_filter=apply_date_filter,
+            task_source=initial_source,
+        )
+        log_info(
+            f"Получить задачу (полевой режим): район «{district.name}»"
+        )
+        if db_conn is None:
+            db_conn = connect_db(config)
+    else:
+        groups_cfg = cfg.get("groups", [])
+        total_steps = sum(len(g.get("subgroups", [])) for g in groups_cfg)
+        progress = QProgressDialog(
+            "Подготовка…",
+            "Отмена",
+            0,
+            max(total_steps, 1),
+            parent or iface.mainWindow(),
+        )
+        progress.setWindowTitle("Monitor CRM")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
 
-    if canceled:
-        log_info("Получить задачу: отменено при сборе")
-        return task_result
+        task_result, canceled = _build_task_result(
+            cfg,
+            district,
+            metric_crs,
+            root,
+            date_from,
+            date_to,
+            apply_date_filter,
+            progress,
+        )
+        progress.close()
 
-    log_info(
-        f"Получить задачу завершено: район «{district.name}», "
-        f"объектов на слоях: {task_result.total_count}"
-    )
+        if canceled:
+            log_info("Получить задачу: отменено при сборе")
+            return task_result
 
-    task_result.task_source = "active"
-    db_conn = _persist_tasks_to_db(config, task_result, parent or iface.mainWindow())
+        log_info(
+            f"Получить задачу завершено: район «{district.name}», "
+            f"объектов на слоях: {task_result.total_count}"
+        )
+
+        task_result.task_source = initial_source
+        db_conn = _persist_tasks_to_db(
+            config,
+            task_result,
+            parent or iface.mainWindow(),
+            db_conn=db_conn,
+            user_session=user_session,
+        )
 
     if db_conn is not None:
         from .crm_tasks_area import preload_area_geometries
@@ -576,7 +625,13 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
     from ..ui.task_dialog import TaskDialog
 
     def _restart():
-        run_get_task(config, iface, parent)
+        run_get_task(
+            config,
+            iface,
+            parent,
+            user_session=user_session,
+            db_conn=db_conn,
+        )
 
     TaskDialog.open(
         task_result,
@@ -586,6 +641,7 @@ def run_get_task(config: Dict[str, Any], iface, parent=None) -> TaskResult:
         district=district,
         apply_date_filter=apply_date_filter,
         on_change_district=_restart,
+        user_session=user_session,
     )
 
     return task_result

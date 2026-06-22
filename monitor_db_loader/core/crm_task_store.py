@@ -2,6 +2,7 @@
 """Сохранение задач CRM в PostgreSQL (crm.tasks)."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from .db import DatabaseConnection
@@ -54,6 +55,62 @@ TASK_COLUMN_LABELS = {
 }
 
 TASK_FORM_FIELDS = ("type",) + TASK_ID_COLUMNS
+
+USER_AUDIT_COLUMNS = ("user_created", "user_last_edit")
+
+_audit_columns_ready: Set[str] = set()
+
+
+def user_audit_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
+    return tuple(
+        f'ALTER TABLE "{schema}"."{table}" '
+        f'ADD COLUMN IF NOT EXISTS "{col}" TEXT[]'
+        for col in USER_AUDIT_COLUMNS
+    )
+
+
+def make_user_audit(login: str) -> List[str]:
+    login = (login or "").strip()
+    stamp = datetime.now(timezone.utc).isoformat()
+    return [login, stamp]
+
+
+def make_user_last_edit(login: str) -> List[str]:
+    """Alias for make_user_audit (backward compatibility)."""
+    return make_user_audit(login)
+
+
+def _upgrade_user_audit_columns(cur, schema: str, table: str) -> None:
+    for col in USER_AUDIT_COLUMNS:
+        cur.execute(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = %s
+            """,
+            (schema, table, col),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] != "text":
+            continue
+        cur.execute(
+            f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col}" TYPE TEXT[] '
+            f'USING CASE WHEN "{col}" IS NULL THEN NULL::text[] '
+            f'ELSE ARRAY["{col}"::text, (now() AT TIME ZONE \'utc\')::text] END'
+        )
+
+
+def ensure_user_audit_columns(pg, schema: str, table: str) -> None:
+    key = f"{schema}.{table}"
+    if key in _audit_columns_ready:
+        return
+    with pg.cursor() as cur:
+        _pg_set_admin_timeouts(cur)
+        for stmt in user_audit_migration_statements(schema, table):
+            cur.execute(stmt)
+        _upgrade_user_audit_columns(cur, schema, table)
+    _audit_columns_ready.add(key)
+
 
 _DDL_STATEMENTS = (
     "CREATE SCHEMA IF NOT EXISTS crm",
@@ -299,6 +356,11 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
     if cache_key in cache:
         _pg_recover_transaction(pg)
         if _table_exists(pg, schema, table):
+            try:
+                ensure_user_audit_columns(pg, schema, table)
+                pg.commit()
+            except Exception:
+                _pg_rollback(pg)
             return True
         cache.discard(cache_key)
 
@@ -311,6 +373,7 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
                 cur.execute(stmt)
             for stmt in _station_migration_statements(schema, table):
                 cur.execute(stmt)
+            ensure_user_audit_columns(pg, schema, table)
             if indexes_dropped_key not in cache:
                 for stmt in _DROP_TASK_ID_UNIQUE_INDEXES:
                     cur.execute(stmt)
@@ -333,6 +396,7 @@ def _apply_snapshot_migrations(
         _pg_set_admin_timeouts(cur)
         for stmt in _snapshot_migration_statements(snapshot_schema, snapshot_table):
             cur.execute(stmt)
+    ensure_user_audit_columns(pg, snapshot_schema, snapshot_table)
 
 
 def _create_snapshot_table(
@@ -798,6 +862,7 @@ def send_task_snapshot(
     store_cfg: Dict[str, Any],
     config_key: str,
     default_table: str,
+    login: str,
 ) -> SendTaskSnapshotResult:
     """Сохранить снимок задачи в таблицу-снимок (без повторов по task_key)."""
     schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
@@ -820,12 +885,19 @@ def send_task_snapshot(
     if not task_type:
         raise ValueError("Поле «type» не может быть пустым")
 
-    columns = ["task_key", "type"] + list(TASK_ID_COLUMNS) + list(STATION_COLUMNS)
+    columns = (
+        ["task_key", "type"]
+        + list(TASK_ID_COLUMNS)
+        + list(STATION_COLUMNS)
+        + list(USER_AUDIT_COLUMNS)
+    )
     values = [record.key, task_type] + [
         _normalize_id_value(getattr(record, col)) for col in TASK_ID_COLUMNS
     ] + [
         _normalize_id_value(getattr(record, col)) for col in STATION_COLUMNS
     ]
+    audit = make_user_audit(login)
+    values += [audit, audit]
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
     query = (
@@ -848,9 +920,10 @@ def send_task_to_field(
     conn: DatabaseConnection,
     record: TaskRecord,
     store_cfg: Dict[str, Any],
+    login: str,
 ) -> SendTaskSnapshotResult:
     return send_task_snapshot(
-        conn, record, store_cfg, "field_table", "tasks_field"
+        conn, record, store_cfg, "field_table", "tasks_field", login
     )
 
 
@@ -858,9 +931,10 @@ def send_task_to_done_legal(
     conn: DatabaseConnection,
     record: TaskRecord,
     store_cfg: Dict[str, Any],
+    login: str,
 ) -> SendTaskSnapshotResult:
     return send_task_snapshot(
-        conn, record, store_cfg, "done_legal_table", "tasks_done_legal"
+        conn, record, store_cfg, "done_legal_table", "tasks_done_legal", login
     )
 
 
@@ -868,9 +942,10 @@ def send_task_to_done_illegal(
     conn: DatabaseConnection,
     record: TaskRecord,
     store_cfg: Dict[str, Any],
+    login: str,
 ) -> SendTaskSnapshotResult:
     return send_task_snapshot(
-        conn, record, store_cfg, "done_illegal_table", "tasks_done_illegal"
+        conn, record, store_cfg, "done_illegal_table", "tasks_done_illegal", login
     )
 
 
@@ -878,9 +953,10 @@ def send_task_to_clear(
     conn: DatabaseConnection,
     record: TaskRecord,
     store_cfg: Dict[str, Any],
+    login: str,
 ) -> SendTaskSnapshotResult:
     return send_task_snapshot(
-        conn, record, store_cfg, "clear_table", "tasks_clear"
+        conn, record, store_cfg, "clear_table", "tasks_clear", login
     )
 
 
@@ -993,6 +1069,7 @@ def update_task_record(
     conn: DatabaseConnection,
     record: TaskRecord,
     store_cfg: Dict[str, Any],
+    login: str,
 ) -> None:
     schema, table = _table_ref(store_cfg)
     pg = _pg_connection(conn)
@@ -1010,14 +1087,20 @@ def update_task_record(
     station_values = {
         col: _normalize_id_value(getattr(record, col)) for col in STATION_COLUMNS
     }
+    audit = make_user_audit(login)
 
     try:
         with pg.cursor() as cur:
             all_columns = list(TASK_ID_COLUMNS) + list(STATION_COLUMNS)
-            set_parts = ['"type" = %s'] + [f'"{col}" = %s' for col in all_columns]
+            set_parts = (
+                ['"type" = %s']
+                + [f'"{col}" = %s' for col in all_columns]
+                + ['"user_last_edit" = %s::text[]']
+            )
             params: List[Any] = [task_type] + [
                 id_values[col] for col in TASK_ID_COLUMNS
             ] + [station_values[col] for col in STATION_COLUMNS]
+            params.append(audit)
             params.append(record.key)
             query = (
                 f'UPDATE "{schema}"."{table}" '
@@ -1040,9 +1123,12 @@ def _task_exists(cur, schema: str, table: str, column: str, value: str) -> bool:
     return cur.fetchone() is not None
 
 
-def _insert_task(cur, schema: str, table: str, row: Dict[str, Any]) -> None:
-    columns = ["type"] + list(TASK_ID_COLUMNS)
-    values = [row["type"]] + [row[col] for col in TASK_ID_COLUMNS]
+def _insert_task(
+    cur, schema: str, table: str, row: Dict[str, Any], login: str
+) -> None:
+    audit = make_user_audit(login)
+    columns = ["type"] + list(TASK_ID_COLUMNS) + list(USER_AUDIT_COLUMNS)
+    values = [row["type"]] + [row[col] for col in TASK_ID_COLUMNS] + [audit, audit]
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
     query = f'INSERT INTO "{schema}"."{table}" ({col_list}) VALUES ({placeholders})'
@@ -1053,6 +1139,7 @@ def persist_task_result(
     conn: DatabaseConnection,
     task_result,
     store_cfg: Dict[str, Any],
+    login: str,
 ) -> PersistStats:
     """Записать уникальные задачи из TaskResult в crm.tasks."""
     stats = PersistStats()
@@ -1093,7 +1180,7 @@ def persist_task_result(
                             stats.skipped += 1
                             continue
 
-                        _insert_task(cur, schema, table, row)
+                        _insert_task(cur, schema, table, row, login)
                         stats.inserted += 1
 
         pg.commit()

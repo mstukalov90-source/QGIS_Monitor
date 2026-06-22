@@ -2,7 +2,7 @@
 """Диалог выбора района для первичного анализа фото и CRM."""
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from qgis.core import QgsVectorLayer
 from qgis.PyQt.QtCore import QDate
@@ -33,6 +33,10 @@ class DistrictChoice:
     apply_date_filter: bool = True
 
 
+def collect_rayon_names(layer: QgsVectorLayer, field: str) -> List[str]:
+    return _collect_rayon_names(layer, field)
+
+
 def _collect_rayon_names(layer: QgsVectorLayer, field: str) -> List[str]:
     idx = layer.fields().indexOf(field)
     if idx < 0:
@@ -58,6 +62,7 @@ class DistrictDialog(QDialog):
         crm_mode: bool = False,
         date_from: Optional[QDate] = None,
         date_to: Optional[QDate] = None,
+        allowed_rayons: Optional[Set[str]] = None,
     ):
         super().__init__(parent)
         title = (
@@ -73,7 +78,10 @@ class DistrictDialog(QDialog):
             apply_crm_theme(self, object_name="crmDistrictCard")
 
         self._field = field
-        self._all_rayons = _collect_rayon_names(layer, field)
+        all_rayons = _collect_rayon_names(layer, field)
+        if allowed_rayons is not None:
+            all_rayons = [r for r in all_rayons if r in allowed_rayons]
+        self._all_rayons = all_rayons
         self._date_filter_checkbox: Optional[QCheckBox] = None
 
         layout = QVBoxLayout(self)
@@ -173,19 +181,29 @@ class DistrictDialog(QDialog):
         return self._date_filter_checkbox.isChecked()
 
     @staticmethod
-    def list_rayons(layer: QgsVectorLayer, field: str) -> List[str]:
-        return _collect_rayon_names(layer, field)
+    def list_rayons(
+        layer: QgsVectorLayer,
+        field: str,
+        allowed_rayons: Optional[Set[str]] = None,
+    ) -> List[str]:
+        rayons = _collect_rayon_names(layer, field)
+        if allowed_rayons is None:
+            return rayons
+        return [r for r in rayons if r in allowed_rayons]
 
     @staticmethod
     def choose(
-        layer: QgsVectorLayer, field: str, parent=None
+        layer: QgsVectorLayer,
+        field: str,
+        parent=None,
+        allowed_rayons: Optional[Set[str]] = None,
     ) -> Optional[str]:
         if layer.fields().indexOf(field) < 0:
             return None
-        rayons = _collect_rayon_names(layer, field)
+        rayons = DistrictDialog.list_rayons(layer, field, allowed_rayons)
         if not rayons:
             return None
-        dlg = DistrictDialog(layer, field, parent)
+        dlg = DistrictDialog(layer, field, parent, allowed_rayons=allowed_rayons)
         if dialog_exec(dlg) != DIALOG_ACCEPTED:
             return None
         selected = dlg.selected_rayon().strip()
@@ -198,10 +216,11 @@ class DistrictDialog(QDialog):
         parent=None,
         date_from: Optional[QDate] = None,
         date_to: Optional[QDate] = None,
+        allowed_rayons: Optional[Set[str]] = None,
     ) -> Optional[DistrictChoice]:
         if layer.fields().indexOf(field) < 0:
             return None
-        rayons = _collect_rayon_names(layer, field)
+        rayons = DistrictDialog.list_rayons(layer, field, allowed_rayons)
         if not rayons:
             return None
         dlg = DistrictDialog(
@@ -211,6 +230,7 @@ class DistrictDialog(QDialog):
             crm_mode=True,
             date_from=date_from,
             date_to=date_to,
+            allowed_rayons=allowed_rayons,
         )
         if dialog_exec(dlg) != DIALOG_ACCEPTED:
             return None

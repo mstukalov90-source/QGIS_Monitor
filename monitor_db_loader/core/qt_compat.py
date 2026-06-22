@@ -138,3 +138,21 @@ def qgs_field(name: str, field_type: int):
     elif hasattr(field, "setType"):
         field.setType(field_type)
     return field
+
+
+def detach_rubber_band(band) -> None:
+    """Отвязать QgsRubberBand от карты (QGIS 3: setMapCanvas, старые API: setCanvas)."""
+    if band is None:
+        return
+    if hasattr(band, "setMapCanvas"):
+        band.setMapCanvas(None)
+    elif hasattr(band, "setCanvas"):
+        band.setCanvas(None)
+    else:
+        try:
+            from qgis.core import QgsWkbTypes
+
+            band.reset(QgsWkbTypes.PolygonGeometry)
+            band.hide()
+        except Exception:
+            pass
