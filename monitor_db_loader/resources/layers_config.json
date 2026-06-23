@@ -682,6 +682,18 @@
       }
     }
   },
+  "photo_view": {
+    "url_mode": "auto",
+    "base_url": "http://77.222.63.161/photos",
+    "api_key": "",
+    "timeout_sec": 60,
+    "sftp_host": "77.222.63.161",
+    "sftp_port": 22,
+    "sftp_user": "root",
+    "sftp_key_path": "",
+    "sftp_remote_dir": "/opt/monitor/downloaded_photo",
+    "local_cache_dir": ""
+  },
   "additional_functionality": {
     "load_on_startup": false,
     "auto_refresh": false,

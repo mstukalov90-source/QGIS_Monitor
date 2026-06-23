@@ -164,6 +164,14 @@ def is_ai_photo_context(subgroup_name: str, layer_key: Optional[str] = None) -> 
     )
 
 
+def ai_photo_uuid_from_attributes(attributes: Dict[str, Any]) -> Optional[str]:
+    value = attributes.get("uuid")
+    if value is None:
+        return None
+    uuid = str(value).strip()
+    return uuid or None
+
+
 def _parse_date_value(value: Any) -> Optional[QDate]:
     if value is None or value == "":
         return None

@@ -2,7 +2,7 @@
 """Диалог редактирования строки crm.tasks."""
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
@@ -37,13 +37,16 @@ from ..core.crm_task_store import (
 from ..core.crm_ui_constants import (
     LEGAL_STATION_FIELDS,
     TASK_SOURCE_LABELS,
+    ai_photo_uuid_from_attributes,
     format_field_observed,
     get_legal_link_fields,
+    is_ai_photo_context,
 )
 from ..core.db import DatabaseConnection
 from ..core.qt_compat import TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
 from .crm_theme import apply_crm_theme, style_button, style_field_observed_label
 from .feature_pick_tool import FeaturePickMapTool
+from .photo_view_dialog import PhotoViewDialog
 
 StatusAction = str
 
@@ -135,6 +138,7 @@ class TaskEditDialog(QDialog):
         group_name: Optional[str] = None,
         task_source: str = "active",
         user_login: str = "",
+        feature_attributes: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(parent)
         self._record = record
@@ -146,6 +150,7 @@ class TaskEditDialog(QDialog):
         self._subgroup_name = subgroup_name
         self._group_name = group_name or record.type
         self._task_source = task_source
+        self._feature_attributes = dict(feature_attributes or {})
         self._readonly_fields, self._link_fields = task_form_field_groups(
             self._group_name, subgroup_name, store_cfg, record
         )
@@ -290,6 +295,12 @@ class TaskEditDialog(QDialog):
         manage_group = QGroupBox("Управление задачей")
         manage_group.setObjectName("crmFormSection")
         manage_row = QHBoxLayout(manage_group)
+        self._view_photo_btn = QPushButton("Посмотреть фото")
+        self._view_photo_btn.setVisible(
+            is_ai_photo_context(self._subgroup_name or "")
+        )
+        self._view_photo_btn.clicked.connect(self._on_view_photo)
+        manage_row.addWidget(self._view_photo_btn)
         self._save_btn = QPushButton("Сохранить")
         self._save_btn.clicked.connect(self._on_save)
         self._save_btn.setVisible(not self._is_readonly)
@@ -373,6 +384,21 @@ class TaskEditDialog(QDialog):
         outer.addWidget(self._status_group)
 
         self._update_legal_highlights()
+
+    def _on_view_photo(self) -> None:
+        uuid = (self._record.photo_uuid or "").strip()
+        if not uuid:
+            uuid = ai_photo_uuid_from_attributes(self._feature_attributes) or ""
+        if not uuid:
+            self._set_message("UUID фотографии не найден", error=True)
+            return
+        if self._config is None:
+            self._set_message(
+                "Просмотр фото недоступен: нет конфигурации плагина.",
+                error=True,
+            )
+            return
+        PhotoViewDialog.open(uuid, self._conn, self._config, self)
 
     def _configure_status_visibility(self) -> None:
         can_field = self._task_source == "active"
@@ -708,6 +734,7 @@ class TaskEditDialog(QDialog):
         task_source: str = "active",
         on_finished: Optional[Callable[[int], None]] = None,
         user_login: str = "",
+        feature_attributes: Optional[Dict[str, Any]] = None,
     ) -> "TaskEditDialog":
         win_parent = parent or (iface.mainWindow() if iface else None)
         dlg = TaskEditDialog(
@@ -721,6 +748,7 @@ class TaskEditDialog(QDialog):
             group_name=group_name,
             task_source=task_source,
             user_login=user_login,
+            feature_attributes=feature_attributes,
         )
         if on_finished is not None:
             dlg.finished.connect(on_finished)

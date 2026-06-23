@@ -45,6 +45,10 @@ def photo_primary_analysis(config: Dict[str, Any]) -> Dict[str, Any]:
     return config.get("photo_primary_analysis", {})
 
 
+def photo_view(config: Dict[str, Any]) -> Dict[str, Any]:
+    return config.get("photo_view", {})
+
+
 def crm_tasks(config: Dict[str, Any]) -> Dict[str, Any]:
     return config.get("crm_tasks", {})
 

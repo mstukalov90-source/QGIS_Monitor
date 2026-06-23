@@ -636,6 +636,7 @@ class TaskDialog(QDialog):
             task_source=self._task_source,
             on_finished=_on_edit_closed,
             user_login=self._current_user_login(),
+            feature_attributes=self._selected_task_feat.attributes,
         )
 
     def _current_user_login(self) -> str:
