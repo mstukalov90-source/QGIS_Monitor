@@ -68,6 +68,7 @@
             {
               "table_name": "contours",
               "display_name": "Контура всех строек",
+              "default_visibility": false,
               "geometry_type": "polygon",
               "symbology": {
                 "fill_color": "#FF0000",
@@ -81,6 +82,7 @@
             {
               "table_name": "contours_wip",
               "display_name": "Контура в работе",
+              "default_visibility": false,
               "geometry_type": "polygon",
               "symbology": {
                 "fill_color": "#FFFF00",
@@ -94,6 +96,7 @@
             {
               "table_name": "contours_done",
               "display_name": "Контура выполненые",
+              "default_visibility": false,
               "geometry_type": "polygon",
               "symbology": {
                 "fill_color": "#008000",

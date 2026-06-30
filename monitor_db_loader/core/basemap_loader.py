@@ -48,7 +48,7 @@ def _move_layer_to_bottom(layer: QgsRasterLayer) -> None:
     if parent is None:
         return
     clone = node.clone()
-    parent.insertChildNode(0, clone)
+    parent.insertChildNode(parent.children().__len__(), clone)
     parent.removeChildNode(node)
 
 
@@ -82,6 +82,6 @@ def ensure_osm_basemap(config: Dict[str, Any]) -> Optional[str]:
     project = QgsProject.instance()
     project.addMapLayer(layer, False)
     root = project.layerTreeRoot()
-    root.insertLayer(0, layer)
+    root.addLayer(layer)
     log_info(f"Подложка «{display_name}» добавлена")
     return layer.id()

@@ -59,7 +59,6 @@ class LayerLoader:
 
     def load_all(self) -> LoadResult:
         result = LoadResult()
-        ensure_osm_basemap(self.config)
         result.total = sum(1 for _ in iter_all_layer_defs(self.config))
         log_info(f"Начало загрузки слоёв (всего в конфиге: {result.total})…")
 
@@ -78,6 +77,7 @@ class LayerLoader:
         )
         for err in result.errors:
             log_warning(err)
+        ensure_osm_basemap(self.config)
         return result
 
     def _load_group(
