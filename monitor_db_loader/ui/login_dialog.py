@@ -25,7 +25,7 @@ from .crm_theme import apply_crm_theme
 class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Monitor DB Loader — вход")
+        self.setWindowTitle("Мониторинг разрытий — вход")
         self.setModal(True)
         apply_crm_theme(self, object_name="crmDistrictCard")
 

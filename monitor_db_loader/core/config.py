@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(PLUGIN_DIR, "resources", "layers_config.json")
-LOG_CHANNEL = "Monitor DB Loader"
+PLUGIN_DISPLAY_NAME = "Мониторинг разрытий"
+LOG_CHANNEL = PLUGIN_DISPLAY_NAME
+LOAD_DATA_HINT = "Сначала выполните загрузку данных из БД"
 
 _GEOM_CANDIDATES = ("geom", "geometry", "the_geom", "wkb_geometry")
 
@@ -47,6 +49,21 @@ def photo_primary_analysis(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def photo_view(config: Dict[str, Any]) -> Dict[str, Any]:
     return config.get("photo_view", {})
+
+
+def field_photo_view(config: Dict[str, Any]) -> Dict[str, Any]:
+    """photo_view с каталогом SFTP для полевых фото и отдельным кэшем."""
+    from .photo_sftp import resolved_cache_dir
+
+    base = dict(photo_view(config))
+    remote = str(
+        base.get("field_sftp_remote_dir", "/opt/monitor/mggtfield_photo")
+    ).rstrip("/")
+    base["sftp_remote_dir"] = remote
+    cache_dir = resolved_cache_dir(base) / "field"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    base["local_cache_dir"] = str(cache_dir)
+    return base
 
 
 def crm_tasks(config: Dict[str, Any]) -> Dict[str, Any]:

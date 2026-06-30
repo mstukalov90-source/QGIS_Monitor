@@ -25,11 +25,84 @@ from .db import DatabaseConnection
 from .log_util import log_info, log_warning
 
 AreaTransitionResult = Literal["updated", "skipped", "not_found"]
+AnaliseTransitionResult = Literal["updated", "skipped", "not_found", "conflict"]
+
+_AREA_STATUS_ACTIONS: Dict[Tuple[Optional[str], str], str] = {
+    (None, "wip"): "order_sent_to_survey",
+    ("wip", "free"): "order_released_from_survey",
+    ("wip", "done"): "order_completed_survey",
+}
+
+
+def _log_area_status_change(
+    conn: DatabaseConnection,
+    *,
+    key: str,
+    login: str,
+    from_status: Optional[str],
+    to_status: str,
+) -> None:
+    from .crm_statistics import log_statistic, resolve_role_from_login
+
+    default_action = _AREA_STATUS_ACTIONS.get((from_status, to_status))
+    if not default_action:
+        return
+
+    role = resolve_role_from_login(conn, login)
+    if to_status == "done" and from_status == "wip":
+        action = "order_completed" if role == "field" else "order_completed_survey"
+    else:
+        action = default_action
+
+    log_statistic(
+        conn,
+        login=login,
+        object_type="order",
+        action=action,
+        object_key=key,
+        metadata={"from_status": from_status, "to_status": to_status},
+        skip_if_exists=action in ("order_completed", "order_completed_survey"),
+    )
+
+ANALISE_AUDIT_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("analise_started_by", "TEXT"),
+    ("analise_started_at", "TIMESTAMPTZ"),
+    ("analise_finished_by", "TEXT"),
+    ("analise_finished_at", "TIMESTAMPTZ"),
+    ("analise_paused_by", "TEXT"),
+    ("analise_paused_at", "TIMESTAMPTZ"),
+)
+
+_analise_audit_ready: set[str] = set()
 
 AreaGeometryRow = Tuple[Dict[str, Any], Optional[QgsGeometry]]
 
 TASKS_AREA_SCHEMA = "crm"
 TASKS_AREA_TABLE = "tasks_area"
+
+
+def ensure_analise_audit_columns(conn: DatabaseConnection) -> bool:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+    key = f"{TASKS_AREA_SCHEMA}.{TASKS_AREA_TABLE}"
+    if key in _analise_audit_ready:
+        return True
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            for col_name, col_type in ANALISE_AUDIT_COLUMNS:
+                cur.execute(
+                    f'ALTER TABLE "{TASKS_AREA_SCHEMA}"."{TASKS_AREA_TABLE}" '
+                    f'ADD COLUMN IF NOT EXISTS "{col_name}" {col_type}'
+                )
+        pg.commit()
+        _analise_audit_ready.add(key)
+        return True
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось добавить analise-столбцы в crm.tasks_area: {exc}")
+        return False
 
 
 def ensure_tasks_area_audit_columns(conn: DatabaseConnection) -> bool:
@@ -117,7 +190,10 @@ def fetch_tasks_area_geometries(
 
     query = f"""
         SELECT key, fid, gid, rayon, okrug, okrug_shor, area, status,
-               date_survey, loaded_at,
+               date_survey, loaded_at, task_number, analise,
+               analise_started_by, analise_started_at,
+               analise_finished_by, analise_finished_at,
+               analise_paused_by, analise_paused_at,
                ST_AsBinary(geom) AS geom_wkb,
                ST_AsText(geom) AS geom_wkt
         FROM crm.tasks_area
@@ -212,6 +288,15 @@ def _rows_to_features(rows: List[AreaGeometryRow]) -> List[TaskFeature]:
     return features
 
 
+def collect_area_orders_for_picker(
+    conn: DatabaseConnection,
+    rayon: str,
+) -> List[TaskFeature]:
+    """Все площадные заказы района для диалога выбора (office)."""
+    rows = get_area_geometries(conn, rayon=rayon, status=None)
+    return _rows_to_features(rows)
+
+
 def collect_tasks_area(
     conn: DatabaseConnection,
     rayon: str,
@@ -262,6 +347,280 @@ def complete_area_survey(
     return _transition_area_status(
         conn, key, login=login, from_status="wip", to_status="done"
     )
+
+
+def _fetch_analise_state(
+    conn: DatabaseConnection, key: str
+) -> Optional[Dict[str, Any]]:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return None
+    ensure_analise_audit_columns(conn)
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    analise,
+                    analise_started_by,
+                    analise_started_at,
+                    analise_paused_by,
+                    analise_paused_at
+                FROM crm.tasks_area
+                WHERE key = %s::uuid
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            if not row:
+                pg.commit()
+                return None
+            cols = [d[0] for d in cur.description]
+            pg.commit()
+            return dict(zip(cols, row))
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось прочитать analise для {key}: {exc}")
+        return None
+
+
+def start_area_analise(
+    conn: DatabaseConnection, key: str, login: str
+) -> AnaliseTransitionResult:
+    ensure_tasks_area_audit_columns(conn)
+    ensure_analise_audit_columns(conn)
+    state = _fetch_analise_state(conn, key)
+    if state is None:
+        return "not_found"
+    if state.get("analise") is True:
+        return "skipped"
+
+    started_at = state.get("analise_started_at")
+    started_by = (state.get("analise_started_by") or "").strip()
+    paused_at = state.get("analise_paused_at")
+    login = login.strip()
+
+    pg = _pg_connection(conn)
+    if pg is None:
+        return "not_found"
+
+    if started_at is None:
+        audit = make_user_audit(login)
+        _pg_recover_transaction(pg)
+        try:
+            with pg.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE crm.tasks_area SET
+                        analise_started_by = %s,
+                        analise_started_at = NOW(),
+                        analise_paused_by = NULL,
+                        analise_paused_at = NULL,
+                        user_last_edit = %s::text[]
+                    WHERE key = %s::uuid
+                      AND COALESCE(analise, FALSE) = FALSE
+                      AND analise_started_at IS NULL
+                    RETURNING key
+                    """,
+                    (login, audit, key),
+                )
+                row = cur.fetchone()
+            pg.commit()
+            if row:
+                invalidate_area_geometries_cache(conn)
+                from .crm_statistics import log_statistic
+
+                log_statistic(
+                    conn,
+                    login=login,
+                    object_type="order",
+                    action="order_analise_started",
+                    object_key=key,
+                    skip_if_exists=False,
+                )
+            return "updated" if row else "not_found"
+        except Exception as exc:
+            _pg_rollback(pg)
+            log_warning(f"start_area_analise {key}: {exc}")
+            return "not_found"
+
+    if paused_at is not None:
+        if started_by != login:
+            return "conflict"
+        audit = make_user_audit(login)
+        _pg_recover_transaction(pg)
+        try:
+            with pg.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE crm.tasks_area SET
+                        analise_paused_by = NULL,
+                        analise_paused_at = NULL,
+                        user_last_edit = %s::text[]
+                    WHERE key = %s::uuid
+                      AND COALESCE(analise, FALSE) = FALSE
+                      AND analise_paused_at IS NOT NULL
+                      AND analise_started_by = %s
+                    RETURNING key
+                    """,
+                    (audit, key, login),
+                )
+                row = cur.fetchone()
+            pg.commit()
+            if row:
+                invalidate_area_geometries_cache(conn)
+                from .crm_statistics import log_statistic
+
+                log_statistic(
+                    conn,
+                    login=login,
+                    object_type="order",
+                    action="order_analise_started",
+                    object_key=key,
+                    metadata={"resumed": True},
+                    skip_if_exists=False,
+                )
+            return "updated" if row else "not_found"
+        except Exception as exc:
+            _pg_rollback(pg)
+            log_warning(f"resume_area_analise {key}: {exc}")
+            return "not_found"
+
+    if started_by == login:
+        return "skipped"
+    return "conflict"
+
+
+def pause_area_analise(
+    conn: DatabaseConnection, key: str, login: str
+) -> AnaliseTransitionResult:
+    ensure_tasks_area_audit_columns(conn)
+    ensure_analise_audit_columns(conn)
+    login = login.strip()
+    audit = make_user_audit(login)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return "not_found"
+
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE crm.tasks_area SET
+                    analise_paused_by = %s,
+                    analise_paused_at = NOW(),
+                    user_last_edit = %s::text[]
+                WHERE key = %s::uuid
+                  AND COALESCE(analise, FALSE) = FALSE
+                  AND analise_started_at IS NOT NULL
+                  AND analise_paused_at IS NULL
+                  AND analise_started_by = %s
+                RETURNING key
+                """,
+                (login, audit, key, login),
+            )
+            row = cur.fetchone()
+        pg.commit()
+        if row:
+            invalidate_area_geometries_cache(conn)
+            from .crm_statistics import log_statistic
+
+            log_statistic(
+                conn,
+                login=login,
+                object_type="order",
+                action="order_analise_paused",
+                object_key=key,
+                skip_if_exists=False,
+            )
+            return "updated"
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"pause_area_analise {key}: {exc}")
+
+    state = _fetch_analise_state(conn, key)
+    if state is None:
+        return "not_found"
+    if state.get("analise") is True:
+        return "skipped"
+    if state.get("analise_paused_at") is not None:
+        return "skipped"
+    return "not_found"
+
+
+def analise_lock_holder(conn: DatabaseConnection, key: str) -> Optional[str]:
+    state = _fetch_analise_state(conn, key)
+    if state is None:
+        return None
+    if state.get("analise") is True:
+        return None
+    if state.get("analise_started_at") is None:
+        return None
+    if state.get("analise_paused_at") is not None:
+        holder = (state.get("analise_started_by") or "").strip()
+        return holder or None
+    holder = (state.get("analise_started_by") or "").strip()
+    return holder or None
+
+
+def complete_area_analise(
+    conn: DatabaseConnection, key: str, login: str
+) -> AnaliseTransitionResult:
+    ensure_tasks_area_audit_columns(conn)
+    ensure_analise_audit_columns(conn)
+    login = login.strip()
+    audit = make_user_audit(login)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return "not_found"
+
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE crm.tasks_area SET
+                    analise = TRUE,
+                    analise_finished_by = %s,
+                    analise_finished_at = NOW(),
+                    analise_paused_by = NULL,
+                    analise_paused_at = NULL,
+                    user_last_edit = %s::text[]
+                WHERE key = %s::uuid
+                  AND COALESCE(analise, FALSE) = FALSE
+                  AND analise_started_by = %s
+                  AND analise_started_at IS NOT NULL
+                  AND analise_paused_at IS NULL
+                RETURNING key
+                """,
+                (login, audit, key, login),
+            )
+            row = cur.fetchone()
+        pg.commit()
+        if row:
+            invalidate_area_geometries_cache(conn)
+            from .crm_statistics import log_statistic
+
+            log_statistic(
+                conn,
+                login=login,
+                object_type="order",
+                action="order_analise_completed",
+                object_key=key,
+            )
+            return "updated"
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"complete_area_analise {key}: {exc}")
+
+    state = _fetch_analise_state(conn, key)
+    if state is None:
+        return "not_found"
+    if state.get("analise") is True:
+        return "skipped"
+    return "not_found"
 
 
 def _transition_area_status(
@@ -317,6 +676,13 @@ def _transition_area_status(
         pg.commit()
         if row:
             invalidate_area_geometries_cache(conn)
+            _log_area_status_change(
+                conn,
+                key=key,
+                login=login,
+                from_status=from_status,
+                to_status=to_status,
+            )
             return "updated"
 
         with pg.cursor() as cur:

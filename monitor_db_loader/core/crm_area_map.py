@@ -31,11 +31,20 @@ from .qt_compat import qgs_field
 AREA_GROUP_NAME = "Monitor CRM — площадные"
 OVERLAY_LAYER_NAME = "Площадные заказы (контур)"
 ACTIVE_LAYER_NAME = "Площадные заказы"
+SELECTED_LAYER_NAME = "Текущий площадный заказ"
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+AREA_STATUS_COLORS = {
+    "free": "#ff9800",
+    "wip": "#fdd835",
+    "done": "#43a047",
+}
 
 AREA_OUTLINE_COLOR = "#0066cc"
 AREA_SELECTION_FILL = QColor(255, 243, 224, 100)
 AREA_SELECTION_STROKE = QColor(255, 152, 0)
+SELECTED_ORDER_FILL = QColor(0, 102, 204, 70)
+SELECTED_ORDER_STROKE = QColor(0, 102, 204)
 
 
 def _area_features_from_result(result: TaskResult) -> List[TaskFeature]:
@@ -48,31 +57,53 @@ def _area_features_from_result(result: TaskResult) -> List[TaskFeature]:
     return features
 
 
-def _create_area_symbol() -> QgsFillSymbol:
+def _status_color(status: str) -> QColor:
+    return QColor(AREA_STATUS_COLORS.get((status or "").strip().lower(), AREA_OUTLINE_COLOR))
+
+
+def _outline_symbol(color: QColor, *, width: float = 0.8, fill_alpha: int = 0) -> QgsFillSymbol:
+    fill = QColor(color)
+    fill.setAlpha(fill_alpha)
     symbol = QgsFillSymbol.createSimple(
         {
-            "color": "0,0,0,0",
-            "outline_color": "0,102,204",
-            "outline_width": "0.8",
+            "color": f"{fill.red()},{fill.green()},{fill.blue()},{fill.alpha()}",
+            "outline_color": color.name(),
+            "outline_width": str(width),
         }
     )
     return symbol
 
 
-def _build_memory_layer(name: str, features: List[TaskFeature]) -> Optional[QgsVectorLayer]:
+def _selected_order_symbol() -> QgsFillSymbol:
+    return _outline_symbol(
+        SELECTED_ORDER_STROKE,
+        width=2.4,
+        fill_alpha=70,
+    )
+
+
+def _build_memory_layer(
+    name: str,
+    features: List[TaskFeature],
+    *,
+    symbol_for_feature=None,
+) -> Optional[QgsVectorLayer]:
     layer = QgsVectorLayer("Multipolygon?crs=EPSG:4326", name, "memory")
     if not layer.isValid():
         layer = QgsVectorLayer("Polygon?crs=EPSG:4326", name, "memory")
     if not layer.isValid():
         return None
 
-    layer.setRenderer(QgsSingleSymbolRenderer(_create_area_symbol()))
+    if symbol_for_feature is None:
+        layer.setRenderer(QgsSingleSymbolRenderer(_outline_symbol(QColor(AREA_OUTLINE_COLOR))))
+
     provider = layer.dataProvider()
 
     fields = QgsFields()
     fields.append(qgs_field("task_key", QVariant.String))
     fields.append(qgs_field("status", QVariant.String))
     fields.append(qgs_field("fid", QVariant.String))
+    fields.append(qgs_field("analise", QVariant.String))
     provider.addAttributes(fields.toList())
     layer.updateFields()
 
@@ -88,6 +119,7 @@ def _build_memory_layer(name: str, features: List[TaskFeature]) -> Optional[QgsV
                 str(feat.task_key or attrs.get("key") or ""),
                 str(attrs.get("status") or ""),
                 str(attrs.get("fid") or ""),
+                str(attrs.get("analise") or ""),
             ]
         )
         qgs_features.append(qgs_feat)
@@ -106,8 +138,10 @@ class TasksAreaMapController:
         self._district_name = normalize_rayon_name(district_name)
         self._overlay_layer: Optional[QgsVectorLayer] = None
         self._active_layer: Optional[QgsVectorLayer] = None
+        self._selected_layer: Optional[QgsVectorLayer] = None
         self._selection_band: Optional[QgsRubberBand] = None
         self._overlay_count: int = 0
+        self._selected_order: Optional[TaskFeature] = None
 
     @property
     def overlay_count(self) -> int:
@@ -141,8 +175,10 @@ class TasksAreaMapController:
     def _clear_layers(self) -> None:
         self._remove_layer(self._overlay_layer)
         self._remove_layer(self._active_layer)
+        self._remove_layer(self._selected_layer)
         self._overlay_layer = None
         self._active_layer = None
+        self._selected_layer = None
         self._overlay_count = 0
 
     def _add_layer(self, layer: QgsVectorLayer) -> None:
@@ -229,6 +265,66 @@ class TasksAreaMapController:
         if fit:
             self._fit_to_layer(layer)
 
+    def show_selected_order(
+        self,
+        order: Optional[TaskFeature],
+        *,
+        fit: bool = True,
+    ) -> None:
+        self._selected_order = order
+        self._remove_layer(self._selected_layer)
+        self._selected_layer = None
+        if order is None or not order.area_geom or order.area_geom.isEmpty():
+            return
+
+        layer = _build_memory_layer(SELECTED_LAYER_NAME, [order])
+        if layer is None:
+            return
+        layer.setRenderer(QgsSingleSymbolRenderer(_selected_order_symbol()))
+        self._selected_layer = layer
+        self._add_layer(layer)
+        if fit:
+            self._fit_to_layer(layer)
+
+    def show_office_orders(
+        self,
+        conn: DatabaseConnection,
+        *,
+        selected_order: Optional[TaskFeature] = None,
+        show_all: bool = False,
+    ) -> None:
+        self._remove_layer(self._overlay_layer)
+        self._overlay_layer = None
+        self._remove_layer(self._active_layer)
+        self._active_layer = None
+
+        if selected_order and not show_all:
+            self.show_selected_order(selected_order, fit=True)
+            self._overlay_count = 1
+            refresh_map_canvas(self._iface)
+            return
+
+        rows = get_area_geometries(conn, self._district_name, status=None)
+        from .crm_tasks_area import _rows_to_features
+
+        features = _rows_to_features(rows)
+        self._overlay_count = len(features)
+        layer = _build_memory_layer(OVERLAY_LAYER_NAME, features)
+        if layer is None:
+            return
+        layer.setRenderer(
+            QgsSingleSymbolRenderer(_outline_symbol(_status_color("wip"), width=1.0, fill_alpha=30))
+        )
+        self._overlay_layer = layer
+        self._add_layer(layer)
+
+        if selected_order:
+            self.show_selected_order(selected_order, fit=False)
+        elif show_all and features:
+            self._fit_to_layer(layer)
+
+        refresh_map_canvas(self._iface)
+
     def refresh(
         self,
         task_source: str,
@@ -236,8 +332,19 @@ class TasksAreaMapController:
         conn: Optional[DatabaseConnection],
         *,
         is_area_source: bool,
+        office_selected_order: Optional[TaskFeature] = None,
+        office_orders_on_map: bool = False,
+        is_office_user: bool = False,
     ) -> None:
         from .crm_ui_constants import is_area_source as _is_area_source
+
+        if is_office_user and office_selected_order is not None and conn is not None:
+            self.show_office_orders(
+                conn,
+                selected_order=office_selected_order,
+                show_all=office_orders_on_map,
+            )
+            return
 
         if _is_area_source(task_source):
             self.show_active(result, fit=True)

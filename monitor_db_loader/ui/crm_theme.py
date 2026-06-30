@@ -290,6 +290,80 @@ QDialog#crmDistrictCard {{
     background: #ffffff;
     border-radius: 12px;
 }}
+
+QDialog#crmAreaOrderPicker {{
+    background: #ffffff;
+    color: {COLOR_TEXT};
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+}}
+
+QLabel#crmAnalisePending {{
+    background: #ffebee;
+    color: #c62828;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+}}
+
+QLabel#crmAnaliseProgress {{
+    background: #e3f2fd;
+    color: #1565c0;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+}}
+
+QLabel#crmAnalisePaused {{
+    background: #fff8e1;
+    color: #f57f17;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+}}
+
+QLabel#crmAnaliseDone {{
+    background: #e8f5e9;
+    color: #2e7d32;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+}}
+
+QLabel#crmOfficeContext {{
+    color: {COLOR_TEXT};
+    font-size: 13px;
+}}
+
+QLabel#crmOfficeEmpty {{
+    color: {COLOR_MUTED};
+    font-size: 14px;
+    padding: 24px;
+}}
+
+QDialog#crmDialog QWidget#crmFieldMaterialsSection {{
+    border-top: 1px solid {COLOR_BORDER_LIGHT};
+    padding-top: 12px;
+    margin-top: 8px;
+}}
+
+QDialog#crmDialog QLabel#crmFieldMaterialsSectionTitle {{
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 4px;
+}}
+
+QDialog#crmDialog QLabel#crmFieldMaterialsBannerMissing {{
+    color: {COLOR_MUTED};
+    font-size: 13px;
+    padding: 8px 0;
+}}
+
+QDialog#crmDialog QScrollArea#crmPhotoScroll {{
+    border: 1px solid {COLOR_BORDER_LIGHT};
+    border-radius: 8px;
+    background: #fafafa;
+}}
 """
 
 
@@ -314,5 +388,13 @@ def style_field_observed_label(label, value: Optional[bool]) -> None:
         label.setObjectName("crmFieldObservedNo")
     else:
         label.setObjectName("crmMuted")
+    label.style().unpolish(label)
+    label.style().polish(label)
+
+
+def style_analise_badge(label, status: str) -> None:
+    from ..core.crm_ui_constants import analise_workflow_status_object_name
+
+    label.setObjectName(analise_workflow_status_object_name(status))
     label.style().unpolish(label)
     label.style().polish(label)

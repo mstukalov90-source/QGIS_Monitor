@@ -31,8 +31,17 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..core.crm_area_map import TasksAreaMapController
-from ..core.config import crm_task_store
-from ..core.crm_snapshot_loader import collect_snapshot_tasks
+from ..core.config import crm_task_store, crm_tasks
+from ..core.crm_filter_by_area import (
+    count_task_result_features,
+    empty_task_result_shell,
+    filter_task_result_by_area,
+    geometry_inside_area,
+)
+from ..core.crm_task_map_layers import (
+    collect_task_result_for_source,
+    create_task_layers_in_qgis,
+)
 from ..core.crm_task_store import (
     enrich_task_result_field_observed,
     fetch_task_by_key,
@@ -48,19 +57,23 @@ from ..core.crm_tasks import (
 )
 from ..core.auth import UserSession, allowed_task_sources
 from ..core.crm_tasks_area import (
-    collect_tasks_area,
+    collect_area_orders_for_picker,
+    complete_area_analise,
     complete_area_survey,
     invalidate_area_geometries_cache,
+    pause_area_analise,
     preload_area_geometries,
     release_area_from_survey,
     send_area_to_survey,
+    start_area_analise,
 )
 from ..core.crm_ui_constants import (
     AREA_STATUS_LABELS,
-    SNAPSHOT_SOURCES,
     TASK_SOURCES,
     TASK_SOURCE_LABELS,
     area_status_from_source,
+    format_analise_workflow_status,
+    format_area_hectares,
     format_area_order_label,
     format_field_observed,
     format_task_table_cell,
@@ -76,6 +89,7 @@ from ..core.task_dxf_export import export_tasks_to_dxf, export_tasks_to_shp
 from ..core.qt_compat import TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
 from .crm_source_tabs import TaskSourceTabs
 from .crm_theme import apply_crm_theme, style_button
+from .area_order_picker_dialog import AreaOrderPickerDialog
 
 TreeRole = Tuple[str, ...]
 
@@ -127,6 +141,14 @@ class TaskDialog(QDialog):
         self._selected_row: Optional[int] = None
         self._table_columns: List = []
         self._busy = False
+        self._office_area_order: Optional[TaskFeature] = None
+        self._office_full_result: Optional[TaskResult] = None
+        self._office_orders_on_map = False
+        self._office_picker: Optional[AreaOrderPickerDialog] = None
+        self._place_point_mode = False
+        self._place_point_busy = False
+        self._pending_link_prefill = None
+        self._place_point_tool = None
         district_name = (
             district.name if district else result.district_name
         )
@@ -163,9 +185,19 @@ class TaskDialog(QDialog):
         self._meta_label.setObjectName("crmMuted")
         layout.addWidget(self._meta_label)
 
+        self._office_context_label = QLabel("")
+        self._office_context_label.setObjectName("crmOfficeContext")
+        self._office_context_label.hide()
+        layout.addWidget(self._office_context_label)
+
         self._source_tabs = TaskSourceTabs(allowed_sources=self._allowed_sources)
         self._source_tabs.set_value(self._task_source)
         self._source_tabs.sourceChanged.connect(self._on_source_changed)
+        self._source_tabs.pauseOrderClicked.connect(self._on_pause_office_order)
+        self._source_tabs.completeOrderClicked.connect(self._on_complete_office_order)
+        self._source_tabs.ordersToggleClicked.connect(self._on_office_orders_toggle)
+        self._source_tabs.selectOrderClicked.connect(self._open_office_order_picker)
+        self._source_tabs.placePointClicked.connect(self._on_toggle_place_point)
         layout.addWidget(self._source_tabs)
 
         expand = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -226,6 +258,10 @@ class TaskDialog(QDialog):
         self._area_complete_btn.clicked.connect(self._on_complete_area_survey)
         footer.addWidget(self._area_complete_btn)
 
+        self._create_layers_btn = QPushButton("Создать слои задач в QGIS")
+        self._create_layers_btn.clicked.connect(self._on_create_task_layers)
+        footer.addWidget(self._create_layers_btn)
+
         self.export_dxf_btn = QPushButton("Экспорт задач в DXF")
         self.export_dxf_btn.clicked.connect(self._on_export_dxf)
         footer.addWidget(self.export_dxf_btn)
@@ -250,6 +286,8 @@ class TaskDialog(QDialog):
             QTimer.singleShot(0, lambda: self._reload_for_source(self._task_source))
         elif self._db_conn and self._store_cfg and self._task_source == "active":
             self._apply_snapshot_filter()
+            if self._is_office_user():
+                QTimer.singleShot(0, self._open_office_order_picker)
         else:
             if self._db_conn and self._store_cfg and not self._is_area():
                 self._enrich_field_observed()
@@ -265,15 +303,415 @@ class TaskDialog(QDialog):
     def _deferred_map_refresh(self) -> None:
         self._refresh_area_map()
         self._update_header()
+        self._update_office_actions()
+
+    def _is_office_user(self) -> bool:
+        return bool(self._user_session and self._user_session.role == "office")
+
+    def _office_working(self) -> bool:
+        return self._is_office_user() and self._office_area_order is not None
+
+    def _office_awaiting_order(self) -> bool:
+        return (
+            self._is_office_user()
+            and self._task_source == "active"
+            and self._office_area_order is None
+        )
+
+    def _office_remaining_count(self) -> int:
+        if not self._office_working() or not self._office_full_result:
+            return 0
+        filtered = filter_task_result_by_area(
+            self._office_full_result, self._office_area_order
+        )
+        return count_task_result_features(filtered)
+
+    def _view_result(self) -> TaskResult:
+        if self._office_awaiting_order() and self._office_full_result:
+            return empty_task_result_shell(self._office_full_result)
+        if self._office_working() and self._office_full_result and self._office_area_order:
+            return filter_task_result_by_area(
+                self._office_full_result, self._office_area_order
+            )
+        return self._result
+
+    def _sync_office_display(self) -> None:
+        if not self._is_office_user() or self._task_source != "active":
+            self._result = self._office_full_result or self._result
+            return
+        if self._office_area_order is None:
+            base = self._office_full_result or self._result
+            self._result = empty_task_result_shell(base)
+        else:
+            self._result = filter_task_result_by_area(
+                self._office_full_result or self._result,
+                self._office_area_order,
+            )
+
+    def _load_area_orders(self) -> List[TaskFeature]:
+        conn = self._get_db_connection()
+        if conn is None or not self._result.district_name:
+            return []
+        try:
+            return collect_area_orders_for_picker(conn, self._result.district_name)
+        except Exception as exc:
+            log_warning(f"Не удалось загрузить площадные заказы: {exc}")
+            return []
+
+    def _open_office_order_picker(self) -> None:
+        if not self._is_office_user():
+            return
+        orders = self._load_area_orders()
+        login = self._current_user_login()
+
+        def _refresh_orders() -> None:
+            if self._office_picker is None:
+                return
+            self._office_picker.set_loading(True)
+            refreshed = self._load_area_orders()
+            self._office_picker.set_orders(refreshed)
+            self._office_picker.set_loading(False)
+
+        self._office_picker = AreaOrderPickerDialog(
+            orders,
+            login,
+            self,
+        )
+        self._office_picker.set_refresh_handler(_refresh_orders)
+        from ..core.qt_compat import DIALOG_ACCEPTED, dialog_exec
+
+        if dialog_exec(self._office_picker) == DIALOG_ACCEPTED:
+            selected = self._office_picker.selected_order()
+            if selected:
+                self._on_office_order_selected(selected)
+        self._office_picker = None
+
+    def _office_order_key(self, order: TaskFeature) -> Optional[str]:
+        key = order.task_key or order.attributes.get("key")
+        return str(key).strip() if key else None
+
+    def _on_office_order_selected(self, order: TaskFeature) -> None:
+        key = self._office_order_key(order)
+        if not key:
+            return
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+        self._busy = True
+        self._update_office_actions()
+        try:
+            result = start_area_analise(conn, key, self._current_user_login())
+            if result == "conflict":
+                QMessageBox.warning(
+                    self,
+                    "Monitor CRM — площадный заказ",
+                    "Заказ уже в работе у другого сотрудника.",
+                )
+                self._open_office_order_picker()
+                return
+            if result == "not_found":
+                QMessageBox.warning(
+                    self,
+                    "Monitor CRM — площадный заказ",
+                    "Не удалось начать анализ заказа.",
+                )
+                return
+            try:
+                preload_area_geometries(conn, self._result.district_name)
+            except Exception:
+                pass
+            refreshed_orders = self._load_area_orders()
+            for item in refreshed_orders:
+                item_key = self._office_order_key(item)
+                if item_key == key:
+                    order = item
+                    break
+            self._office_area_order = order
+            self._office_orders_on_map = False
+            self._sync_office_display()
+            self._populate_tree()
+            self._clear_row_selection()
+            first = self._first_subgroup_item()
+            if first:
+                self.tree.setCurrentItem(first)
+            else:
+                self._fill_table(None)
+            self._refresh_area_map()
+            self._update_status()
+        finally:
+            self._busy = False
+            self._update_office_actions()
+
+    def _on_pause_office_order(self) -> None:
+        if not self._office_working():
+            return
+        key = self._office_order_key(self._office_area_order)
+        if not key:
+            return
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+        self._busy = True
+        try:
+            result = pause_area_analise(conn, key, self._current_user_login())
+            if result not in ("updated", "skipped"):
+                QMessageBox.warning(
+                    self,
+                    "Monitor CRM — площадный заказ",
+                    "Не удалось приостановить анализ.",
+                )
+                return
+            self._office_area_order = None
+            self._office_orders_on_map = False
+            self._sync_office_display()
+            self._populate_tree()
+            self._clear_row_selection()
+            self._fill_table(None)
+            self._refresh_area_map()
+            self._update_status()
+            self._open_office_order_picker()
+        finally:
+            self._busy = False
+            self._update_office_actions()
+
+    def _on_complete_office_order(self) -> None:
+        if not self._office_working():
+            return
+        remaining = self._office_remaining_count()
+        if remaining > 0:
+            QMessageBox.information(
+                self,
+                "Monitor CRM — площадный заказ",
+                f"В полигоне остались активные задачи: {remaining}",
+            )
+            return
+        key = self._office_order_key(self._office_area_order)
+        if not key:
+            return
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+        self._busy = True
+        try:
+            result = complete_area_analise(conn, key, self._current_user_login())
+            if result not in ("updated", "skipped"):
+                QMessageBox.warning(
+                    self,
+                    "Monitor CRM — площадный заказ",
+                    "Не удалось завершить анализ.",
+                )
+                return
+            self._on_refresh()
+            self._office_area_order = None
+            self._office_orders_on_map = False
+            self._sync_office_display()
+            self._populate_tree()
+            self._clear_row_selection()
+            self._fill_table(None)
+            self._refresh_area_map()
+            self._update_status()
+            self._open_office_order_picker()
+        finally:
+            self._busy = False
+            self._update_office_actions()
+
+    def _on_office_orders_toggle(self) -> None:
+        if not self._office_working():
+            return
+        self._office_orders_on_map = self._source_tabs._orders_toggle_btn.isChecked()
+        self._refresh_area_map()
+        self._update_office_actions()
+
+    def _update_office_actions(self) -> None:
+        if not self._is_office_user():
+            self._office_context_label.hide()
+            self._source_tabs.set_office_actions(visible=False)
+            return
+
+        self._office_context_label.show()
+        self._source_tabs.set_office_actions(
+            visible=self._task_source == "active",
+            awaiting_order=self._office_awaiting_order(),
+            working=self._office_working(),
+            can_complete=self._office_working() and self._office_remaining_count() == 0,
+            complete_tooltip=(
+                f"В полигоне остались активные задачи: {self._office_remaining_count()}"
+                if self._office_working() and self._office_remaining_count() > 0
+                else "Завершить анализ заказа"
+            ),
+            orders_on_map=self._office_orders_on_map,
+            place_point_mode=self._place_point_mode,
+        )
+
+        if self._office_working() and self._office_area_order:
+            attrs = self._office_area_order.attributes or {}
+            order_label = format_area_order_label(self._office_area_order)
+            area_text = format_area_hectares(attrs.get("area"))
+            status_text = format_analise_workflow_status(attrs)
+            remaining = self._office_remaining_count()
+            parts = [f"Заказ: <b>{order_label}</b>"]
+            if area_text:
+                parts.append(area_text)
+            parts.append(f"Статус: {status_text}")
+            parts.append(f"Осталось задач: <b>{remaining}</b>")
+            self._office_context_label.setText(" · ".join(parts))
+            self._office_context_label.setTextFormat(TEXT_FORMAT_RICH)
+        elif self._office_awaiting_order():
+            self._office_context_label.setText(
+                "Выберите площадный заказ для начала сопоставления"
+            )
+            self._office_context_label.setTextFormat(Qt.PlainText)
+        else:
+            self._office_context_label.hide()
+
+    def _on_toggle_place_point(self) -> None:
+        if not self._office_working() or self._place_point_busy:
+            return
+        checked = self._source_tabs._place_point_btn.isChecked()
+        self._enable_place_point_mode(checked)
+
+    def start_place_office_point_from_edit(
+        self, link_prefill: Optional[dict] = None
+    ) -> None:
+        self._enable_place_point_mode(True, link_prefill)
+
+    def _enable_place_point_mode(
+        self,
+        active: bool,
+        link_prefill: Optional[dict] = None,
+    ) -> None:
+        if link_prefill is not None:
+            self._pending_link_prefill = link_prefill
+
+        if not active:
+            self._place_point_mode = False
+            self._pending_link_prefill = None
+            if self._place_point_tool and self._iface:
+                self._iface.mapCanvas().unsetMapTool(self._place_point_tool)
+            self.status_label.setObjectName("crmMuted")
+            self.status_label.setText("")
+            self._update_office_actions()
+            return
+
+        if not self._iface or not self._office_area_order:
+            return
+
+        self._place_point_mode = True
+        if self._place_point_tool is None:
+            from .office_place_point_tool import OfficePlacePointMapTool
+
+            self._place_point_tool = OfficePlacePointMapTool(self._iface.mapCanvas())
+            self._place_point_tool.pointPlaced.connect(self._on_office_point_placed)
+        self._iface.mapCanvas().setMapTool(self._place_point_tool)
+        self.status_label.setObjectName("crmPickBanner")
+        self.status_label.setText(
+            "Укажите точку разрывия на карте внутри полигона заказа"
+        )
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+        self._update_office_actions()
+
+    def _metric_srid(self) -> int:
+        from qgis.core import QgsCoordinateReferenceSystem
+
+        cfg = crm_tasks(self._config or {})
+        metric_crs = QgsCoordinateReferenceSystem(cfg.get("metric_crs", "EPSG:32637"))
+        metric_srid = metric_crs.postgisSrid()
+        if metric_srid > 0:
+            return metric_srid
+        auth = metric_crs.authid() or ""
+        if auth.upper().startswith("EPSG:"):
+            try:
+                return int(auth.split(":", 1)[1])
+            except ValueError:
+                pass
+        return 32637
+
+    def _reload_office_data_subgroup(self) -> None:
+        conn = self._db_conn
+        if not conn or not self._district or not self._store_cfg:
+            return
+        from ..core.crm_office_data import append_office_data_to_result
+
+        base = self._office_full_result or self._result
+        append_office_data_to_result(
+            base,
+            conn,
+            self._district,
+            self._store_cfg,
+            self._metric_srid(),
+        )
+        if self._office_full_result is not None:
+            self._office_full_result = base
+
+    def _on_office_point_placed(self, lng: float, lat: float) -> None:
+        if not self._office_working() or self._place_point_busy:
+            return
+
+        area_order = self._office_area_order
+        area_key = self._office_order_key(area_order) if area_order else None
+        if not area_key:
+            return
+
+        from qgis.core import QgsCoordinateReferenceSystem, QgsGeometry, QgsPointXY
+
+        point_geom = QgsGeometry.fromPointXY(QgsPointXY(lng, lat))
+        area_geom = area_order.area_geom if area_order else None
+        if area_geom and not geometry_inside_area(point_geom, area_geom):
+            QMessageBox.warning(
+                self,
+                "Monitor CRM",
+                "Точка должна находиться внутри полигона площадного заказа.",
+            )
+            return
+
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+
+        self._place_point_busy = True
+        self._update_office_actions()
+        try:
+            from ..core.crm_office_tasks import create_office_task
+
+            create_office_task(
+                conn,
+                self._current_user_login(),
+                lng,
+                lat,
+                area_key,
+                link_prefill=self._pending_link_prefill,
+                store_cfg=self._store_cfg,
+            )
+            self._reload_office_data_subgroup()
+            self._sync_office_display()
+            self._populate_tree()
+            self._update_status()
+            self._refresh_area_map()
+            self.status_label.setObjectName("crmSuccess")
+            self.status_label.setText("Точка камерального анализа добавлена")
+            self._enable_place_point_mode(False)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Monitor CRM",
+                str(exc),
+            )
+        finally:
+            self._place_point_busy = False
+            self._update_office_actions()
 
     def _refresh_area_map(self) -> None:
         if not self._area_map:
             return
         self._area_map.refresh(
             self._task_source,
-            self._result,
+            self._view_result(),
             self._db_conn,
             is_area_source=self._is_area(),
+            office_selected_order=self._office_area_order,
+            office_orders_on_map=self._office_orders_on_map,
+            is_office_user=self._is_office_user(),
         )
 
     def _area_status_message(self) -> Optional[str]:
@@ -286,14 +724,22 @@ class TaskDialog(QDialog):
         return f"Нет площадных заказов ({label}) в районе «{self._result.district_name}»"
 
     def _update_header(self) -> None:
+        view = self._view_result()
         name = self._result.district_name
         source_label = TASK_SOURCE_LABELS.get(self._task_source, self._task_source)
-        self._district_label.setText(f"Район: <b>{name}</b>")
+        login = self._current_user_login()
+        header_parts = [f"Район: <b>{name}</b>"]
+        if login:
+            header_parts.append(f"Пользователь: {login}")
+        self._district_label.setText(" · ".join(header_parts))
 
-        parts = [f"{source_label}: {self._result.total_count}"]
+        parts = [f"{source_label}: {view.total_count}"]
+        if self._office_working():
+            parts.append(f"На карте: {view.total_count}")
         if (
             self._task_source == "active"
-            and self._result.total_count == 0
+            and view.total_count == 0
+            and not self._office_working()
             and self._area_map
             and self._area_map.overlay_count > 0
         ):
@@ -312,8 +758,13 @@ class TaskDialog(QDialog):
     def _update_status(self) -> None:
         self._update_header()
         self._update_action_buttons()
+        self._update_office_actions()
         area_msg = self._area_status_message()
-        if area_msg:
+        if self._office_awaiting_order():
+            self.status_label.setText(
+                "Выберите площадный заказ — кнопка «Выбрать заказ» или диалог после сбора задач."
+            )
+        elif area_msg:
             self.status_label.setText(area_msg)
         else:
             self.status_label.clear()
@@ -374,6 +825,10 @@ class TaskDialog(QDialog):
         self._enrich_field_observed()
         if self._task_source == "active":
             self._active_result = copy_task_result(self._result)
+            if self._is_office_user():
+                self._office_full_result = copy_task_result(self._result)
+                if self._office_area_order is None:
+                    self._sync_office_display()
         self._populate_tree()
         self._clear_row_selection()
         if self._current_subgroup and self._current_subgroup.features:
@@ -389,7 +844,8 @@ class TaskDialog(QDialog):
 
     def _populate_tree(self) -> None:
         self.tree.clear()
-        for group_index, group in enumerate(self._result.groups):
+        view = self._view_result()
+        for group_index, group in enumerate(view.groups):
             group_count = sum(len(sub.features) for sub in group.subgroups)
             group_item = QTreeWidgetItem([f"{group.name} ({group_count})"])
             group_item.setData(0, Qt.UserRole, ("group", group_index))
@@ -424,7 +880,7 @@ class TaskDialog(QDialog):
         group_index = int(role[1])
         sub_index = int(role[2])
         try:
-            return self._result.groups[group_index].subgroups[sub_index]
+            return self._view_result().groups[group_index].subgroups[sub_index]
         except (IndexError, ValueError):
             return None
 
@@ -433,10 +889,10 @@ class TaskDialog(QDialog):
             return ""
         if role[0] == "group" and len(role) == 2:
             group_index = int(role[1])
-            return self._result.groups[group_index].name
+            return self._view_result().groups[group_index].name
         if role[0] == "sub" and len(role) == 3:
             group_index = int(role[1])
-            return self._result.groups[group_index].name
+            return self._view_result().groups[group_index].name
         return ""
 
     def _on_tree_selection_changed(self, current, previous) -> None:
@@ -589,7 +1045,7 @@ class TaskDialog(QDialog):
             return
         if not self._store_cfg:
             QMessageBox.warning(
-                self, "Monitor DB Loader — задачи",
+                self, "Мониторинг разрытий — задачи",
                 "Конфигурация task_store не найдена.",
             )
             return
@@ -613,7 +1069,7 @@ class TaskDialog(QDialog):
         if record is None:
             QMessageBox.warning(
                 self,
-                "Monitor DB Loader — задачи",
+                "Мониторинг разрытий — задачи",
                 "Задача не найдена в crm.tasks.\n\n"
                 "Сначала сохраните задачи при получении списка.",
             )
@@ -637,6 +1093,8 @@ class TaskDialog(QDialog):
             on_finished=_on_edit_closed,
             user_login=self._current_user_login(),
             feature_attributes=self._selected_task_feat.attributes,
+            office_working=self._office_working(),
+            on_start_place_office_point=self.start_place_office_point_from_edit,
         )
 
     def _current_user_login(self) -> str:
@@ -731,7 +1189,7 @@ class TaskDialog(QDialog):
                 return
             QMessageBox.warning(
                 self,
-                "Monitor DB Loader — задачи",
+                "Мониторинг разрытий — задачи",
                 "Для этого источника нужно подключение к БД и район.",
             )
             self._source_tabs.set_value(self._task_source)
@@ -748,25 +1206,20 @@ class TaskDialog(QDialog):
         progress.show()
 
         try:
-            if source == "active":
-                self._result = copy_task_result(self._active_result)
-                if self._store_cfg:
-                    filter_sent_tasks_from_result(
-                        self._result, conn, self._store_cfg
-                    )
-                self._enrich_field_observed()
-            elif source in SNAPSHOT_SOURCES:
-                self._result = collect_snapshot_tasks(
-                    conn, self._district, source, self._config
-                )
-                self._enrich_field_observed()
-            else:
-                status = area_status_from_source(source)
-                if not status:
-                    raise ValueError(f"Неизвестный источник: {source}")
-                self._result = collect_tasks_area(
-                    conn, self._district.name, status
-                )
+            self._result = collect_task_result_for_source(
+                source,
+                conn,
+                self._district,
+                self._config,
+                active_result=self._active_result,
+                store_cfg=self._store_cfg,
+            )
+            if source == "active" and self._is_office_user():
+                self._office_full_result = copy_task_result(self._result)
+                if self._office_area_order:
+                    self._sync_office_display()
+                else:
+                    self._result = empty_task_result_shell(self._result)
             self._task_source = source
             self._source_tabs.set_value(source)
             self._populate_tree()
@@ -780,19 +1233,75 @@ class TaskDialog(QDialog):
             self._update_status()
         except Exception as exc:
             QMessageBox.warning(
-                self, "Monitor DB Loader — задачи", str(exc)
+                self, "Мониторинг разрытий — задачи", str(exc)
             )
             self._source_tabs.set_value(self._task_source)
         finally:
             progress.close()
             self._source_tabs.set_loading(False)
 
+    def _on_create_task_layers(self) -> None:
+        if not self._config or not self._district:
+            QMessageBox.warning(
+                self,
+                "Мониторинг разрытий — задачи",
+                "Для создания слоёв нужны конфигурация плагина и выбранный район.",
+            )
+            return
+
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+
+        stats = create_task_layers_in_qgis(
+            self._iface,
+            conn,
+            self._district,
+            self._config,
+            self._allowed_sources,
+            active_result=self._active_result,
+            parent=self,
+        )
+
+        if stats.layers_created == 0 and not stats.warnings:
+            QMessageBox.information(
+                self,
+                "Мониторинг разрытий — задачи",
+                f"В районе «{self._result.district_name}» нет задач "
+                f"для создания слоёв.",
+            )
+            return
+
+        lines = [
+            f"Слоёв: {stats.layers_created}",
+            f"Объектов: {stats.features_added}",
+        ]
+        if stats.features_skipped:
+            lines.append(f"Пропущено без геометрии: {stats.features_skipped}")
+        if stats.warnings:
+            lines.append("")
+            lines.append("Предупреждения:")
+            lines.extend(f"• {w}" for w in stats.warnings)
+
+        if stats.layers_created == 0:
+            QMessageBox.warning(
+                self,
+                "Мониторинг разрытий — задачи",
+                "Не удалось создать слои задач.\n\n" + "\n".join(lines),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Мониторинг разрытий — задачи",
+                "Слои задач добавлены в проект QGIS.\n\n" + "\n".join(lines),
+            )
+
     def _on_export_dxf(self) -> None:
         if self._result.total_count == 0:
-            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Нет объектов для экспорта.")
+            QMessageBox.warning(self, "Мониторинг разрытий — задачи", "Нет объектов для экспорта.")
             return
         if not self._config:
-            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Конфигурация плагина не найдена.")
+            QMessageBox.warning(self, "Мониторинг разрытий — задачи", "Конфигурация плагина не найдена.")
             return
         default_name = f"tasks_{self._result.district_name or 'export'}.dxf"
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт задач в DXF", default_name, "DXF files (*.dxf)")
@@ -801,24 +1310,24 @@ class TaskDialog(QDialog):
         if not path.lower().endswith(".dxf"):
             path += ".dxf"
         progress = QProgressDialog("Экспорт задач в DXF…", "Отмена", 0, max(self._result.total_count, 1), self)
-        progress.setWindowTitle("Monitor DB Loader")
+        progress.setWindowTitle("Мониторинг разрытий")
         progress.setMinimumDuration(0)
         stats = export_tasks_to_dxf(path, self._result, self._config)
         progress.setValue(self._result.total_count)
         if stats.errors:
-            QMessageBox.critical(self, "Monitor DB Loader — задачи", "Не удалось экспортировать задачи в DXF:\n" + "\n".join(stats.errors))
+            QMessageBox.critical(self, "Мониторинг разрытий — задачи", "Не удалось экспортировать задачи в DXF:\n" + "\n".join(stats.errors))
             return
         QMessageBox.information(
-            self, "Monitor DB Loader — задачи",
+            self, "Мониторинг разрытий — задачи",
             f"Экспорт завершён.\n\nDXF: {path}\nID (CSV): {stats.csv_path}\nОбъектов: {stats.exported}",
         )
 
     def _on_export_shp(self) -> None:
         if self._result.total_count == 0:
-            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Нет объектов для экспорта.")
+            QMessageBox.warning(self, "Мониторинг разрытий — задачи", "Нет объектов для экспорта.")
             return
         if not self._config:
-            QMessageBox.warning(self, "Monitor DB Loader — задачи", "Конфигурация плагина не найдена.")
+            QMessageBox.warning(self, "Мониторинг разрытий — задачи", "Конфигурация плагина не найдена.")
             return
         default_name = f"tasks_{self._result.district_name or 'export'}.shp"
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт задач в SHP", default_name, "Shapefile (*.shp)")
@@ -827,14 +1336,14 @@ class TaskDialog(QDialog):
         if not path.lower().endswith(".shp"):
             path += ".shp"
         progress = QProgressDialog("Экспорт задач в SHP…", "Отмена", 0, max(self._result.total_count, 1), self)
-        progress.setWindowTitle("Monitor DB Loader")
+        progress.setWindowTitle("Мониторинг разрытий")
         progress.setMinimumDuration(0)
         stats = export_tasks_to_shp(path, self._result, self._config)
         progress.setValue(self._result.total_count)
         if stats.errors:
-            QMessageBox.critical(self, "Monitor DB Loader — задачи", "Не удалось экспортировать задачи в SHP:\n" + "\n".join(stats.errors))
+            QMessageBox.critical(self, "Мониторинг разрытий — задачи", "Не удалось экспортировать задачи в SHP:\n" + "\n".join(stats.errors))
             return
-        QMessageBox.information(self, "Monitor DB Loader — задачи", f"Экспорт завершён.\n\nSHP: {path}\nОбъектов: {stats.exported}")
+        QMessageBox.information(self, "Мониторинг разрытий — задачи", f"Экспорт завершён.\n\nSHP: {path}\nОбъектов: {stats.exported}")
 
     def _ensure_layer_visible(self, layer) -> None:
         if layer is None:
@@ -874,6 +1383,21 @@ class TaskDialog(QDialog):
             self._clear_highlight()
             if self._area_map:
                 self._area_map.highlight_feature(task_feat)
+            return
+
+        if task_feat.task_geom and not task_feat.task_geom.isEmpty():
+            from qgis.core import QgsCoordinateReferenceSystem
+
+            canvas = self._iface.mapCanvas()
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            rect = self._zoom_extent_for_geometry(
+                task_feat.task_geom, wgs84, canvas
+            )
+            if rect is None:
+                return
+            canvas.setExtent(rect)
+            canvas.refresh()
+            self._clear_highlight()
             return
 
         layer = task_feat.layer
@@ -939,6 +1463,7 @@ class TaskDialog(QDialog):
         return dlg
 
     def closeEvent(self, event) -> None:
+        self._enable_place_point_mode(False)
         self._clear_highlight()
         if self._area_map:
             try:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Main plugin class for Monitor DB Loader."""
+"""Main plugin class for Мониторинг разрытий."""
 
 import os
 from typing import Optional
@@ -12,6 +12,7 @@ from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from .core.auth import DB_PASSWORD, UserSession, authenticate
 from .core.config import (
     LOG_CHANNEL,
+    PLUGIN_DISPLAY_NAME,
     database_connection,
     load_config,
     load_on_startup,
@@ -43,23 +44,25 @@ class MonitorDbLoader:
         icon_path = os.path.join(self.plugin_dir, "icon.png")
         icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
 
-        self.action = QAction(icon, "Загрузить слои Monitor DB", self.iface.mainWindow())
+        menu_path = f"&{PLUGIN_DISPLAY_NAME}"
+
+        self.action = QAction(icon, "Загрузка данных из БД", self.iface.mainWindow())
         self.action.triggered.connect(self.run)
-        self.iface.addPluginToMenu("&Monitor DB Loader", self.action)
+        self.iface.addPluginToMenu(menu_path, self.action)
         self.iface.addToolBarIcon(self.action)
 
         self.analysis_action = QAction(
             icon, "Первичный анализ фото", self.iface.mainWindow()
         )
         self.analysis_action.triggered.connect(self.run_primary_analysis)
-        self.iface.addPluginToMenu("&Monitor DB Loader", self.analysis_action)
+        self.iface.addPluginToMenu(menu_path, self.analysis_action)
         self.iface.addToolBarIcon(self.analysis_action)
 
         self.task_action = QAction(
             icon, "Получить задачу", self.iface.mainWindow()
         )
         self.task_action.triggered.connect(self.run_get_task)
-        self.iface.addPluginToMenu("&Monitor DB Loader", self.task_action)
+        self.iface.addPluginToMenu(menu_path, self.task_action)
         self.iface.addToolBarIcon(self.task_action)
 
         try:
@@ -76,16 +79,17 @@ class MonitorDbLoader:
             QTimer.singleShot(500, self.run)
 
     def unload(self):
+        menu_path = f"&{PLUGIN_DISPLAY_NAME}"
         if self.task_action:
-            self.iface.removePluginMenu("&Monitor DB Loader", self.task_action)
+            self.iface.removePluginMenu(menu_path, self.task_action)
             self.iface.removeToolBarIcon(self.task_action)
             del self.task_action
         if self.analysis_action:
-            self.iface.removePluginMenu("&Monitor DB Loader", self.analysis_action)
+            self.iface.removePluginMenu(menu_path, self.analysis_action)
             self.iface.removeToolBarIcon(self.analysis_action)
             del self.analysis_action
         if self.action:
-            self.iface.removePluginMenu("&Monitor DB Loader", self.action)
+            self.iface.removePluginMenu(menu_path, self.action)
             self.iface.removeToolBarIcon(self.action)
             del self.action
 
@@ -98,7 +102,7 @@ class MonitorDbLoader:
         except Exception as exc:
             QMessageBox.critical(
                 self.iface.mainWindow(),
-                "Monitor DB Loader",
+                PLUGIN_DISPLAY_NAME,
                 f"Не удалось загрузить конфигурацию:\n{exc}",
             )
             return False
@@ -114,7 +118,7 @@ class MonitorDbLoader:
         conn.close()
         QMessageBox.critical(
             self.iface.mainWindow(),
-            "Monitor DB Loader — ошибка подключения",
+            f"{PLUGIN_DISPLAY_NAME} — ошибка подключения",
             f"Не удалось подключиться к базе данных:\n{err}",
         )
         return None
@@ -145,7 +149,7 @@ class MonitorDbLoader:
 
             QMessageBox.warning(
                 parent,
-                "Monitor DB Loader — вход",
+                f"{PLUGIN_DISPLAY_NAME} — вход",
                 "Неверный логин или пароль.",
             )
 
@@ -199,7 +203,7 @@ class MonitorDbLoader:
             return
 
         try:
-            log_info("Запуск загрузки Monitor DB Loader…")
+            log_info(f"Запуск загрузки {PLUGIN_DISPLAY_NAME}…")
             if self._loaded_layer_ids or self._loaded_group_names:
                 loader_cleanup = LayerLoader(self._config, conn, session)
                 loader_cleanup.remove_previous_layers(

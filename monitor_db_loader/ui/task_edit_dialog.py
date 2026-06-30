@@ -21,6 +21,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..core.crm_office_link_prefill import office_task_link_prefill
 from ..core.crm_pick import LinkPickBundle, resolve_link_pick_bundle
 from ..core.crm_task_store import (
     CRM_GROUP_ORDERS,
@@ -47,6 +48,7 @@ from ..core.qt_compat import TEXT_FORMAT_RICH, register_modeless_dialog, show_mo
 from .crm_theme import apply_crm_theme, style_button, style_field_observed_label
 from .feature_pick_tool import FeaturePickMapTool
 from .photo_view_dialog import PhotoViewDialog
+from .field_materials_dialog import FieldMaterialsDialog
 
 StatusAction = str
 
@@ -139,6 +141,8 @@ class TaskEditDialog(QDialog):
         task_source: str = "active",
         user_login: str = "",
         feature_attributes: Optional[Dict[str, Any]] = None,
+        office_working: bool = False,
+        on_start_place_office_point: Optional[Callable[[Optional[Dict[str, str]]], None]] = None,
     ):
         super().__init__(parent)
         self._record = record
@@ -151,6 +155,8 @@ class TaskEditDialog(QDialog):
         self._group_name = group_name or record.type
         self._task_source = task_source
         self._feature_attributes = dict(feature_attributes or {})
+        self._office_working = office_working
+        self._on_start_place_office_point = on_start_place_office_point
         self._readonly_fields, self._link_fields = task_form_field_groups(
             self._group_name, subgroup_name, store_cfg, record
         )
@@ -220,7 +226,12 @@ class TaskEditDialog(QDialog):
         self._source_section.setObjectName("crmFormSection")
         source_form = QFormLayout(self._source_section)
         for field_name in self._readonly_fields:
-            edit = QLineEdit(getattr(record, field_name) or "")
+            raw = getattr(record, field_name, "")
+            if isinstance(raw, bool):
+                text = "да" if raw else "нет"
+            else:
+                text = str(raw or "")
+            edit = QLineEdit(text)
             edit.setReadOnly(True)
             self._fields[field_name] = edit
             source_form.addRow(TASK_COLUMN_LABELS.get(field_name, field_name), edit)
@@ -301,6 +312,20 @@ class TaskEditDialog(QDialog):
         )
         self._view_photo_btn.clicked.connect(self._on_view_photo)
         manage_row.addWidget(self._view_photo_btn)
+        self._view_field_materials_btn = QPushButton("Просмотр полевых материалов")
+        self._view_field_materials_btn.setVisible(
+            self._record.field_observed is True
+        )
+        self._view_field_materials_btn.clicked.connect(self._on_view_field_materials)
+        manage_row.addWidget(self._view_field_materials_btn)
+        self._add_office_point_btn = QPushButton("Добавить точку камерального анализа")
+        self._add_office_point_btn.setVisible(
+            self._office_working
+            and self._group_name == CRM_GROUP_ORDERS
+            and self._on_start_place_office_point is not None
+        )
+        self._add_office_point_btn.clicked.connect(self._on_add_office_point)
+        manage_row.addWidget(self._add_office_point_btn)
         self._save_btn = QPushButton("Сохранить")
         self._save_btn.clicked.connect(self._on_save)
         self._save_btn.setVisible(not self._is_readonly)
@@ -399,6 +424,29 @@ class TaskEditDialog(QDialog):
             )
             return
         PhotoViewDialog.open(uuid, self._conn, self._config, self)
+
+    def _on_view_field_materials(self) -> None:
+        task_key = (self._record.key or "").strip()
+        if not task_key:
+            self._set_message("Ключ задачи не найден", error=True)
+            return
+        if self._config is None:
+            self._set_message(
+                "Просмотр материалов недоступен: нет конфигурации плагина.",
+                error=True,
+            )
+            return
+        FieldMaterialsDialog.open(task_key, self._conn, self._config, self)
+
+    def _on_add_office_point(self) -> None:
+        if not self._on_start_place_office_point:
+            return
+        prefill = office_task_link_prefill(
+            self._subgroup_name or "",
+            self._feature_attributes,
+        )
+        self._on_start_place_office_point(prefill)
+        self.accept()
 
     def _configure_status_visibility(self) -> None:
         can_field = self._task_source == "active"
@@ -537,7 +585,7 @@ class TaskEditDialog(QDialog):
     def _start_link_pick(self) -> None:
         if self._iface is None or self._config is None:
             QMessageBox.warning(
-                self, "Monitor DB Loader — задачи",
+                self, "Мониторинг разрытий — задачи",
                 "Выбор с карты недоступен: нет доступа к карте QGIS.",
             )
             return
@@ -545,9 +593,9 @@ class TaskEditDialog(QDialog):
         if bundle is None or not bundle.layers:
             missing = ", ".join(bundle.missing) if bundle and bundle.missing else "—"
             QMessageBox.warning(
-                self, "Monitor DB Loader — задачи",
+                self, "Мониторинг разрытий — задачи",
                 "Слои для сопоставления не найдены в проекте.\n\n"
-                f"Загрузите слои Monitor DB.\nНе найдено: {missing}",
+                f"Сначала выполните загрузку данных из БД.\nНе найдено: {missing}",
             )
             return
         tool = self._ensure_pick_tool()
@@ -602,7 +650,7 @@ class TaskEditDialog(QDialog):
 
     def _on_pick_failed(self, message: str) -> None:
         parent = self._iface.mainWindow() if self._iface else self
-        QMessageBox.warning(parent, "Monitor DB Loader — задачи", message)
+        QMessageBox.warning(parent, "Мониторинг разрытий — задачи", message)
 
     def _set_busy(self, busy: bool) -> None:
         self._set_form_enabled(not busy)
@@ -648,7 +696,7 @@ class TaskEditDialog(QDialog):
             return
         except Exception as exc:
             QMessageBox.critical(
-                self, "Monitor DB Loader — задачи",
+                self, "Мониторинг разрытий — задачи",
                 f"Не удалось сохранить задачу:\n{exc}",
             )
             return
@@ -692,7 +740,7 @@ class TaskEditDialog(QDialog):
             return
         except Exception as exc:
             QMessageBox.critical(
-                self, "Monitor DB Loader — задачи",
+                self, "Мониторинг разрытий — задачи",
                 f"Не удалось изменить статус:\n{exc}",
             )
             return
@@ -735,6 +783,8 @@ class TaskEditDialog(QDialog):
         on_finished: Optional[Callable[[int], None]] = None,
         user_login: str = "",
         feature_attributes: Optional[Dict[str, Any]] = None,
+        office_working: bool = False,
+        on_start_place_office_point: Optional[Callable[[Optional[Dict[str, str]]], None]] = None,
     ) -> "TaskEditDialog":
         win_parent = parent or (iface.mainWindow() if iface else None)
         dlg = TaskEditDialog(
@@ -749,6 +799,8 @@ class TaskEditDialog(QDialog):
             task_source=task_source,
             user_login=user_login,
             feature_attributes=feature_attributes,
+            office_working=office_working,
+            on_start_place_office_point=on_start_place_office_point,
         )
         if on_finished is not None:
             dlg.finished.connect(on_finished)

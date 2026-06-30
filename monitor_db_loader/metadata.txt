@@ -1,9 +1,9 @@
 [general]
-name=Monitor DB Loader
+name=Мониторинг разрытий
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Подключение к БД агрегатору данных для мониторинга строек и разрытий. Целевая версия QGIS 3.44 LTR.
-version=1.25.1
+version=1.27.1
 author=StukalovMN
 email=
 

@@ -68,7 +68,7 @@ class DistrictDialog(QDialog):
         title = (
             "Monitor CRM — получить задачу"
             if crm_mode
-            else "Monitor DB Loader — выбор района"
+            else "Мониторинг разрытий — выбор района"
         )
         self.setWindowTitle(title)
         self.setModal(True)

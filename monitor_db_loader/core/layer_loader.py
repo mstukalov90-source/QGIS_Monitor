@@ -18,6 +18,7 @@ from .config import (
     ungrouped_layers,
 )
 from .db import DatabaseConnection
+from .basemap_loader import ensure_osm_basemap
 from .log_util import log_info, log_warning
 from .symbology import apply_symbology
 
@@ -58,6 +59,7 @@ class LayerLoader:
 
     def load_all(self) -> LoadResult:
         result = LoadResult()
+        ensure_osm_basemap(self.config)
         result.total = sum(1 for _ in iter_all_layer_defs(self.config))
         log_info(f"Начало загрузки слоёв (всего в конфиге: {result.total})…")
 
@@ -219,13 +221,13 @@ class LayerLoader:
         if result.failed == 0:
             QMessageBox.information(
                 parent,
-                "Monitor DB Loader",
+                "Мониторинг разрытий",
                 f"Загружено слоёв: {result.loaded} из {result.total}.",
             )
         else:
             QMessageBox.information(
                 parent,
-                "Monitor DB Loader",
+                "Мониторинг разрытий",
                 f"Загружено {result.loaded} из {result.total} слоёв.\n"
                 f"Ошибок: {result.failed}. Подробности — в журнале сообщений QGIS.",
             )

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
+from .crm_ui_constants import FIELD_DATA_SUBGROUP, OFFICE_DATA_SUBGROUP
 from .db import DatabaseConnection
 from .log_util import log_info, log_warning
 
@@ -22,6 +23,13 @@ TASK_ID_COLUMNS = (
     "localwork_id",
     "avr_mos_id",
 )
+
+_SNAPSHOT_STAT_ACTIONS: Dict[str, str] = {
+    "field_table": "task_sent_to_field",
+    "done_legal_table": "task_closed_legal",
+    "done_illegal_table": "task_closed_illegal",
+    "clear_table": "task_marked_clear",
+}
 
 CRM_GROUP_DISRUPTIONS = "Разрытия"
 CRM_GROUP_ORDERS = "Новые ордера ОАТИ, АВР и земляные работы"
@@ -42,6 +50,8 @@ TASK_COLUMN_LABELS = {
     "key": "Ключ задачи",
     "type": "Тип",
     "field_observed": "Обследовано в поле",
+    "is_field_data": "Полевые данные",
+    "is_office_task": "Камеральный анализ",
     "photo_uuid": "Фото ИИ (uuid)",
     "photo_lens": "Фото Объектив (external_report_id)",
     "ogh_id": "ОГХ (id)",
@@ -163,6 +173,8 @@ def _station_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
 
 _TASK_SELECT_COLUMNS = ("key", "type") + TASK_ID_COLUMNS + STATION_COLUMNS + (
     "field_observed",
+    "is_field_data",
+    "is_office_task",
 )
 
 
@@ -241,6 +253,8 @@ class TaskRecord:
     kgs: Optional[str] = None
     station_avr: Optional[str] = None
     field_observed: Optional[bool] = None
+    is_field_data: Optional[bool] = None
+    is_office_task: Optional[bool] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -257,6 +271,8 @@ class TaskRecord:
             "kgs": self.kgs,
             "station_avr": self.station_avr,
             "field_observed": self.field_observed,
+            "is_field_data": self.is_field_data,
+            "is_office_task": self.is_office_task,
         }
 
     @classmethod
@@ -264,6 +280,12 @@ class TaskRecord:
         field_observed = None
         if len(row) > 12 and row[12] is not None:
             field_observed = bool(row[12])
+        is_field_data = None
+        if len(row) > 13 and row[13] is not None:
+            is_field_data = bool(row[13])
+        is_office_task = None
+        if len(row) > 14 and row[14] is not None:
+            is_office_task = bool(row[14])
         return cls(
             key=str(row[0]),
             type=row[1] or "",
@@ -278,6 +300,8 @@ class TaskRecord:
             kgs=_normalize_id_value(row[10]) if len(row) > 10 else None,
             station_avr=_normalize_id_value(row[11]) if len(row) > 11 else None,
             field_observed=field_observed,
+            is_field_data=is_field_data,
+            is_office_task=is_office_task,
         )
 
 
@@ -910,6 +934,17 @@ def send_task_snapshot(
             cur.execute(query, values)
         pg.commit()
         log_info(f"crm.{table}: отправлена задача {record.key}")
+        if config_key in _SNAPSHOT_STAT_ACTIONS:
+            from .crm_statistics import log_statistic
+
+            log_statistic(
+                conn,
+                login=login,
+                object_type="task",
+                action=_SNAPSHOT_STAT_ACTIONS[config_key],
+                object_key=record.key,
+                metadata={"task_type": task_type},
+            )
         return "inserted"
     except Exception:
         _pg_rollback(pg)
@@ -1036,9 +1071,17 @@ def resolve_primary_task_column(
     record: Optional[TaskRecord] = None,
 ) -> Optional[str]:
     """Столбец crm.tasks для исходного объекта по имени подгруппы."""
+    if subgroup_name == FIELD_DATA_SUBGROUP:
+        return None
+    if record is not None and record.is_field_data:
+        return None
+    if record is not None and record.is_office_task:
+        return None
     if subgroup_name:
         mapping = store_cfg.get("subgroups", {}).get(subgroup_name)
         if mapping:
+            if mapping.get("source") in ("field_data", "office_data"):
+                return None
             task_column = mapping.get("task_column")
             if task_column in TASK_ID_COLUMNS:
                 return task_column
@@ -1057,8 +1100,17 @@ def task_form_field_groups(
     record: TaskRecord,
 ) -> Tuple[List[str], List[str]]:
     """Поля формы «Исполнить задачу»: readonly (источник) и link (сопоставление)."""
+    if record.is_field_data or subgroup_name == FIELD_DATA_SUBGROUP:
+        readonly: List[str] = ["type", "is_field_data"]
+        link = list(LINK_COLUMNS_BY_GROUP.get(group_name or "", ()))
+        return readonly, link
+    if record.is_office_task or subgroup_name == OFFICE_DATA_SUBGROUP:
+        readonly = ["type", "is_office_task"]
+        link = list(LINK_COLUMNS_BY_GROUP.get(group_name or "", ()))
+        return readonly, link
+
     primary = resolve_primary_task_column(subgroup_name, store_cfg, record)
-    readonly: List[str] = ["type"]
+    readonly = ["type"]
     if primary:
         readonly.append(primary)
     link = list(LINK_COLUMNS_BY_GROUP.get(group_name or "", ()))
@@ -1112,6 +1164,17 @@ def update_task_record(
                 raise ValueError(f"Задача с ключом {record.key} не найдена")
         pg.commit()
         log_info(f"crm.tasks: обновлена задача {record.key}")
+        from .crm_statistics import log_statistic
+
+        log_statistic(
+            conn,
+            login=login,
+            object_type="task",
+            action="task_updated",
+            object_key=record.key,
+            metadata={"task_type": task_type},
+            skip_if_exists=False,
+        )
     except Exception:
         _pg_rollback(pg)
         raise

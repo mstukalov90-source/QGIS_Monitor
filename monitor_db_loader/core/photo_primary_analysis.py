@@ -429,7 +429,7 @@ def run_primary_analysis(
     if not cfg:
         QMessageBox.critical(
             parent or iface.mainWindow(),
-            "Monitor DB Loader",
+            "Мониторинг разрытий",
             "Секция photo_primary_analysis отсутствует в конфигурации.",
         )
         return AnalysisResult(errors=["Конфигурация не найдена"])
@@ -450,15 +450,15 @@ def run_primary_analysis(
     if boundaries_layer is None:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
-            f"Слой «{boundaries_name}» не найден.\n\nСначала загрузите слои Monitor DB.",
+            "Мониторинг разрытий — первичный анализ",
+            f"Слой «{boundaries_name}» не найден.\n\nСначала выполните загрузку данных из БД.",
         )
         return AnalysisResult(errors=[boundaries_name])
 
     if boundaries_layer.fields().indexOf(boundaries_field) < 0:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
+            "Мониторинг разрытий — первичный анализ",
             f"В слое «{boundaries_name}» нет поля «{boundaries_field}».",
         )
         return AnalysisResult(errors=[boundaries_field])
@@ -479,7 +479,7 @@ def run_primary_analysis(
     ):
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
+            "Мониторинг разрытий — первичный анализ",
             (
                 f"Нет доступных районов в слое «{boundaries_name}»."
                 if allowed_rayons is not None
@@ -504,7 +504,7 @@ def run_primary_analysis(
     if district is None:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
+            "Мониторинг разрытий — первичный анализ",
             f"Не удалось загрузить полигон района «{rayon}».",
         )
         return AnalysisResult(errors=[rayon])
@@ -519,7 +519,7 @@ def run_primary_analysis(
         6,
         parent or iface.mainWindow(),
     )
-    progress.setWindowTitle("Monitor DB Loader")
+    progress.setWindowTitle("Мониторинг разрытий")
     progress.setMinimumDuration(0)
     progress.setValue(0)
 
@@ -550,8 +550,8 @@ def run_primary_analysis(
         log_warning(msg.replace("\n", "; "))
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
-            msg + "\n\nСначала загрузите слои Monitor DB.",
+            "Мониторинг разрытий — первичный анализ",
+            msg + "\n\nСначала выполните загрузку данных из БД.",
         )
         progress.close()
         return AnalysisResult(errors=missing)
@@ -559,7 +559,7 @@ def run_primary_analysis(
     if not source_layers:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
+            "Мониторинг разрытий — первичный анализ",
             "Исходные слои не найдены в проекте.",
         )
         progress.close()
@@ -576,7 +576,7 @@ def run_primary_analysis(
     if not source_points:
         QMessageBox.information(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — первичный анализ",
+            "Мониторинг разрытий — первичный анализ",
             f"В районе «{district.name}» нет исходных точек для анализа.",
         )
         progress.close()
@@ -704,7 +704,7 @@ def run_primary_analysis(
 
     QMessageBox.information(
         parent or iface.mainWindow(),
-        "Monitor DB Loader — первичный анализ",
+        "Мониторинг разрытий — первичный анализ",
         f"Анализ завершён — район «{district.name}» ({analysis.total} точек):\n"
         f"• Зелёная таблица: {analysis.green}\n"
         f"• Жёлтая таблица: {analysis.yellow}\n"

@@ -25,7 +25,7 @@ from ..core.qt_compat import (
 class PasswordDialog(QDialog):
     def __init__(self, connection_name: str, parent=None, *, crm_theme: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("Monitor DB Loader — пароль")
+        self.setWindowTitle("Мониторинг разрытий — пароль")
         self.setModal(True)
         if crm_theme:
             from .crm_theme import apply_crm_theme

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Monitor DB Loader QGIS plugin."""
+"""Мониторинг разрытий QGIS plugin."""
 
 from .monitor_db_loader import MonitorDbLoader
 

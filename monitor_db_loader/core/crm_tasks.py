@@ -46,6 +46,7 @@ class TaskFeature:
     sent_at: Optional[str] = None
     area_geom: Optional[QgsGeometry] = None
     layer_key: Optional[str] = None
+    task_geom: Optional[QgsGeometry] = None
 
 
 @dataclass
@@ -91,6 +92,7 @@ def copy_task_feature(feat: TaskFeature) -> TaskFeature:
         sent_at=feat.sent_at,
         area_geom=feat.area_geom,
         layer_key=feat.layer_key,
+        task_geom=feat.task_geom,
     )
 
 
@@ -282,6 +284,24 @@ def _build_task_result(
             if progress.wasCanceled():
                 return result, True
 
+            if sub_cfg.get("source") == "field_data":
+                group.subgroups.append(
+                    TaskSubgroup(name=sub_name, features=[])
+                )
+                log_info(
+                    f"CRM подгруппа «{sub_name}»: загрузка из БД после сохранения"
+                )
+                continue
+
+            if sub_cfg.get("source") == "office_data":
+                group.subgroups.append(
+                    TaskSubgroup(name=sub_name, features=[])
+                )
+                log_info(
+                    f"CRM подгруппа «{sub_name}»: загрузка из БД после сохранения"
+                )
+                continue
+
             layer_names = sub_cfg.get("layers", [])
             group_names = sub_cfg.get("groups", [])
             layers, missing = resolve_layers(root, layer_names, group_names)
@@ -371,7 +391,7 @@ def _persist_tasks_to_db(
             conn.close()
         QMessageBox.warning(
             parent,
-            "Monitor DB Loader — задачи",
+            "Мониторинг разрытий — задачи",
             f"Не удалось записать задачи в БД:\n{exc}\n\n"
             f"Список объектов будет показан без сохранения.",
         )
@@ -385,7 +405,7 @@ def _persist_tasks_to_db(
     if stats.inserted > 0 or stats.skipped > 0:
         QMessageBox.information(
             parent,
-            "Monitor DB Loader — задачи",
+            "Мониторинг разрытий — задачи",
             f"Запись в crm.tasks:\n"
             f"• Добавлено: {stats.inserted}\n"
             f"• Уже в БД: {stats.skipped}\n"
@@ -394,7 +414,7 @@ def _persist_tasks_to_db(
     elif stats.invalid > 0:
         QMessageBox.warning(
             parent,
-            "Monitor DB Loader — задачи",
+            "Мониторинг разрытий — задачи",
             f"Не удалось сохранить задачи в crm.tasks:\n"
             f"• Без ID (нет поля-идентификатора): {stats.invalid}",
         )
@@ -422,7 +442,7 @@ def run_get_task(
     if not cfg:
         QMessageBox.critical(
             parent or iface.mainWindow(),
-            "Monitor DB Loader",
+            "Мониторинг разрытий",
             "Секция crm_tasks отсутствует в конфигурации.",
         )
         empty_result.errors = ["Конфигурация не найдена"]
@@ -441,8 +461,8 @@ def run_get_task(
     if boundaries_layer is None:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — получить задачу",
-            f"Слой «{boundaries_name}» не найден.\n\nСначала загрузите слои Monitor DB.",
+            "Мониторинг разрытий — получить задачу",
+            f"Слой «{boundaries_name}» не найден.\n\nСначала выполните загрузку данных из БД.",
         )
         return TaskResult(
             district_name="",
@@ -454,7 +474,7 @@ def run_get_task(
     if boundaries_layer.fields().indexOf(boundaries_field) < 0:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — получить задачу",
+            "Мониторинг разрытий — получить задачу",
             f"В слое «{boundaries_name}» нет поля «{boundaries_field}».",
         )
         return TaskResult(
@@ -480,7 +500,7 @@ def run_get_task(
     ):
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — получить задачу",
+            "Мониторинг разрытий — получить задачу",
             (
                 f"Нет доступных районов в слое «{boundaries_name}»."
                 if allowed_rayons is not None
@@ -519,7 +539,7 @@ def run_get_task(
     if district is None:
         QMessageBox.warning(
             parent or iface.mainWindow(),
-            "Monitor DB Loader — получить задачу",
+            "Мониторинг разрытий — получить задачу",
             f"Не удалось загрузить полигон района «{rayon}».",
         )
         return TaskResult(
@@ -600,6 +620,36 @@ def run_get_task(
             db_conn=db_conn,
             user_session=user_session,
         )
+
+        if db_conn is not None:
+            from .crm_field_data import append_field_data_to_result
+            from .crm_office_data import append_office_data_to_result
+
+            store_cfg = crm_task_store(config)
+            metric_srid = metric_crs.postgisSrid()
+            if metric_srid <= 0:
+                auth = metric_crs.authid() or ""
+                if auth.upper().startswith("EPSG:"):
+                    try:
+                        metric_srid = int(auth.split(":", 1)[1])
+                    except ValueError:
+                        metric_srid = 32637
+                else:
+                    metric_srid = 32637
+            append_field_data_to_result(
+                task_result,
+                db_conn,
+                district,
+                store_cfg,
+                metric_srid,
+            )
+            append_office_data_to_result(
+                task_result,
+                db_conn,
+                district,
+                store_cfg,
+                metric_srid,
+            )
 
     if db_conn is not None:
         from .crm_tasks_area import preload_area_geometries

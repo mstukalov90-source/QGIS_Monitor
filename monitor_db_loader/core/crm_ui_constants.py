@@ -19,6 +19,7 @@ TaskSource = Literal[
 ]
 
 AreaStatus = Literal["free", "wip", "done"]
+AnaliseWorkflowStatus = Literal["idle", "in_progress", "paused", "done"]
 
 TASK_SOURCES: Tuple[TaskSource, ...] = (
     "active",
@@ -57,6 +58,10 @@ OATI_ORDERS_SUBGROUP = "Ордера ОАТИ"
 EARTHWORK_SUBGROUP = "Уведомления на земляные работы"
 AVR_SUBGROUP = "Аварийно-восстановительные работы"
 LOCAL_REPAIR_SUBGROUP = "Текущие локальные ремонты"
+FIELD_DATA_SUBGROUP = "Полевые данные"
+FIELD_DATA_LAYER_KEY = "field_data"
+OFFICE_DATA_SUBGROUP = "Задачи из камерального анализа"
+OFFICE_DATA_LAYER_KEY = "office_data"
 
 AREA_LAYER_KEY = "tasks_area"
 AREA_LAYER_NAME = "Площадные заказы"
@@ -107,11 +112,18 @@ TASK_TABLE_COLUMNS: Dict[str, List[TaskTableColumn]] = {
         TaskTableColumn("customer", "Заказчик"),
         TaskTableColumn("global_id", "Номер data.mos"),
     ],
+    FIELD_DATA_SUBGROUP: [
+        TaskTableColumn("created_at", "Дата обследования", "date"),
+    ],
+    OFFICE_DATA_SUBGROUP: [
+        TaskTableColumn("created_at", "Дата создания", "date"),
+    ],
 }
 
 AREA_TASK_TABLE_COLUMNS: List[TaskTableColumn] = [
+    TaskTableColumn("task_number", "Номер задачи"),
     TaskTableColumn("fid", "FID заказа"),
-    TaskTableColumn("area", "Площадь"),
+    TaskTableColumn("area", "Площадь", "area_hectares"),
     TaskTableColumn("date_survey", "Дата обследования", "date"),
 ]
 
@@ -124,8 +136,78 @@ def normalize_rayon_name(value: str) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def format_area_hectares(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    hectares = num / 10_000.0
+    return f"{hectares:,.2f} га".replace(",", " ")
+
+
+def is_analise_complete(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text in ("true", "t", "1", "yes", "да")
+
+
+def _has_analise_timestamp(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def analise_workflow_status(attrs: Dict[str, Any]) -> AnaliseWorkflowStatus:
+    if is_analise_complete(attrs.get("analise")):
+        return "done"
+    if _has_analise_timestamp(attrs.get("analise_paused_at")):
+        return "paused"
+    if _has_analise_timestamp(attrs.get("analise_started_at")):
+        return "in_progress"
+    return "idle"
+
+
+def can_start_analise(attrs: Dict[str, Any], current_login: str) -> bool:
+    status = analise_workflow_status(attrs)
+    login = (current_login or "").strip()
+    started_by = str(attrs.get("analise_started_by") or "").strip()
+    if status == "idle":
+        return True
+    if status in ("paused", "in_progress"):
+        return started_by == login
+    return False
+
+
+def format_analise_workflow_status(attrs: Dict[str, Any]) -> str:
+    status = analise_workflow_status(attrs)
+    if status == "done":
+        return "Обработан"
+    if status == "idle":
+        return "Не обработан"
+    if status == "paused":
+        return "Приостановлен"
+    started_by = str(attrs.get("analise_started_by") or "").strip()
+    return f"В работе ({started_by})" if started_by else "В работе"
+
+
+def analise_workflow_status_object_name(status: AnaliseWorkflowStatus) -> str:
+    mapping = {
+        "done": "crmAnaliseDone",
+        "in_progress": "crmAnaliseProgress",
+        "paused": "crmAnalisePaused",
+        "idle": "crmAnalisePending",
+    }
+    return mapping.get(status, "crmAnalisePending")
+
+
 def format_area_order_label(feat) -> str:
     attrs = getattr(feat, "attributes", {}) or {}
+    task_number = attrs.get("task_number")
+    if task_number is not None and str(task_number).strip():
+        return str(task_number).strip()
     fid = attrs.get("fid")
     if fid is not None and str(fid).strip():
         return str(fid)
@@ -161,6 +243,20 @@ def is_ai_photo_context(subgroup_name: str, layer_key: Optional[str] = None) -> 
     return (
         subgroup_name == AI_PHOTO_SUBGROUP
         or layer_key == AI_PHOTO_LAYER_KEY
+    )
+
+
+def is_field_data_context(subgroup_name: str, layer_key: Optional[str] = None) -> bool:
+    return (
+        subgroup_name == FIELD_DATA_SUBGROUP
+        or layer_key == FIELD_DATA_LAYER_KEY
+    )
+
+
+def is_office_data_context(subgroup_name: str, layer_key: Optional[str] = None) -> bool:
+    return (
+        subgroup_name == OFFICE_DATA_SUBGROUP
+        or layer_key == OFFICE_DATA_LAYER_KEY
     )
 
 
@@ -210,6 +306,8 @@ def format_field_observed(value: Any) -> str:
 def format_task_table_cell(value: Any, fmt: Optional[str] = None) -> str:
     if fmt == "field_observed":
         return format_field_observed(value)
+    if fmt == "area_hectares":
+        return format_area_hectares(value)
     if value is None or value == "":
         return ""
     if fmt == "date":

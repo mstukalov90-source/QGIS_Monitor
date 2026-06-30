@@ -604,6 +604,14 @@
           {
             "name": "Разрытия из полигонов ОГХ",
             "layers": ["Разрытия из паспортов ОГХ"]
+          },
+          {
+            "name": "Полевые данные",
+            "source": "field_data"
+          },
+          {
+            "name": "Задачи из камерального анализа",
+            "source": "office_data"
           }
         ]
       },
@@ -678,6 +686,19 @@
         "Аварийно-восстановительные работы": {
           "task_column": "avr_mos_id",
           "source_field": "em_call_reg_num"
+        },
+        "Полевые данные": {
+          "source": "field_data",
+          "reports_schema": "mggt_field",
+          "reports_table": "reports",
+          "reports_tasks_key": "tasks_key",
+          "reports_geometry": "point"
+        },
+        "Задачи из камерального анализа": {
+          "source": "office_data",
+          "points_schema": "crm",
+          "points_table": "office_task_points",
+          "points_geometry": "point"
         }
       }
     }
@@ -692,6 +713,7 @@
     "sftp_user": "root",
     "sftp_key_path": "",
     "sftp_remote_dir": "/opt/monitor/downloaded_photo",
+    "field_sftp_remote_dir": "/opt/monitor/mggtfield_photo",
     "local_cache_dir": ""
   },
   "additional_functionality": {
@@ -699,6 +721,13 @@
     "auto_refresh": false,
     "password_remember": false,
     "collapse_groups_on_load": true,
+    "basemap": {
+      "enabled": true,
+      "display_name": "OpenStreetMap",
+      "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      "zmin": 0,
+      "zmax": 19
+    },
     "error_handling": {
       "connection_failed": "Show error message and retry option",
       "layer_load_failed": "Skip layer and log error"
@@ -710,6 +739,7 @@
     "stroymonitoring": "СтройМониторинг",
     "lens": "Данные Объектив",
     "genplan": "Данные ГенПлан (photo_meta, order)",
-    "odh_export": "Границы районов, объекты ДГИ, ООЗТ (oozt), разрывия (ogh-disruption)"
+    "odh_export": "Границы районов, объекты ДГИ, ООЗТ (oozt), разрывия (ogh-disruption)",
+    "mggt_field": "Полевые отчёты МГГТ Field (reports)"
   }
 }
