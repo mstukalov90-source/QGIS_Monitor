@@ -22,6 +22,7 @@ class TaskSourceTabs(QWidget):
     ordersToggleClicked = pyqtSignal()
     selectOrderClicked = pyqtSignal()
     placePointClicked = pyqtSignal()
+    syncDistrictClicked = pyqtSignal()
 
     def __init__(self, parent=None, allowed_sources: Optional[List[TaskSource]] = None):
         super().__init__(parent)
@@ -68,6 +69,11 @@ class TaskSourceTabs(QWidget):
         self._select_order_btn.clicked.connect(self.selectOrderClicked.emit)
         row_office.addWidget(self._select_order_btn)
 
+        self._sync_district_btn = QPushButton("Синхронизировать задачи района")
+        style_button(self._sync_district_btn, "crmBtnPrimary")
+        self._sync_district_btn.clicked.connect(self.syncDistrictClicked.emit)
+        row_office.addWidget(self._sync_district_btn)
+
         self._orders_toggle_btn = QPushButton("Заказы на карте")
         self._orders_toggle_btn.setCheckable(True)
         self._orders_toggle_btn.clicked.connect(self.ordersToggleClicked.emit)
@@ -91,6 +97,7 @@ class TaskSourceTabs(QWidget):
         outer.addLayout(row_office)
         self._office_row_widgets = [
             self._select_order_btn,
+            self._sync_district_btn,
             self._orders_toggle_btn,
             self._pause_order_btn,
             self._complete_order_btn,
@@ -130,6 +137,8 @@ class TaskSourceTabs(QWidget):
             return
 
         self._select_order_btn.setVisible(awaiting_order or working)
+        self._sync_district_btn.setVisible(True)
+        self._sync_district_btn.setEnabled(not self._loading)
         self._orders_toggle_btn.setVisible(working)
         self._pause_order_btn.setVisible(working)
         self._complete_order_btn.setVisible(working)

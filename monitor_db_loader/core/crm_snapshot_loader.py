@@ -23,6 +23,7 @@ from .crm_tasks import (
     TaskResult,
     TaskSubgroup,
     _date_filter_range,
+    _feature_to_task,
 )
 from .crm_ui_constants import SNAPSHOT_SOURCES
 from .db import DatabaseConnection
@@ -144,6 +145,76 @@ def _subgroup_cfg(
     return None
 
 
+def build_district_feature_index(
+    store_cfg: Dict[str, Any],
+    crm_cfg: Dict[str, Any],
+    district: DistrictBoundary,
+    metric_crs,
+) -> Dict[Tuple[str, str], TaskFeature]:
+    """Индекс (subgroup_name, business_id) → TaskFeature внутри района."""
+    index: Dict[Tuple[str, str], TaskFeature] = {}
+    root = QgsProject.instance().layerTreeRoot()
+
+    for subgroup_name, mapping in store_cfg.get("subgroups", {}).items():
+        source_field = mapping.get("source_field")
+        if not source_field:
+            continue
+        sub_cfg = _subgroup_cfg(subgroup_name, crm_cfg)
+        if sub_cfg is None:
+            continue
+        layers, _ = resolve_layers(
+            root,
+            sub_cfg.get("layers", []),
+            sub_cfg.get("groups", []),
+        )
+        for layer in layers:
+            if layer.fields().indexOf(source_field) < 0:
+                continue
+            for feat in features_in_district(layer, district, metric_crs):
+                business_id = _normalize_id_value(feat[source_field])
+                if not business_id:
+                    continue
+                lookup_key = (subgroup_name, business_id)
+                if lookup_key in index:
+                    continue
+                index[lookup_key] = _feature_to_task(layer, feat)
+    return index
+
+
+def lookup_feature_in_index(
+    snap: SnapshotRow,
+    store_cfg: Dict[str, Any],
+    feature_index: Dict[Tuple[str, str], TaskFeature],
+) -> Optional[TaskFeature]:
+    mapping = store_cfg.get("subgroups", {}).get(snap.subgroup_name)
+    if not mapping:
+        return None
+
+    task_column = mapping.get("task_column")
+    business_id = getattr(snap.record, task_column, None)
+    if not business_id:
+        return None
+
+    base = feature_index.get((snap.subgroup_name, str(business_id).strip()))
+    if base is None:
+        return None
+
+    attrs = dict(base.attributes)
+    attrs["_task_key"] = snap.task_key
+    attrs["_snapshot_key"] = snap.snapshot_key
+    if snap.sent_at:
+        attrs["_sent_at"] = snap.sent_at
+    return TaskFeature(
+        layer=base.layer,
+        layer_name=base.layer_name,
+        feature_id=base.feature_id,
+        attributes=attrs,
+        task_key=snap.task_key,
+        sent_at=snap.sent_at,
+        task_geom=base.task_geom,
+    )
+
+
 def lookup_feature_in_project(
     snap: SnapshotRow,
     store_cfg: Dict[str, Any],
@@ -223,11 +294,13 @@ def collect_snapshot_tasks(
         conn, store_cfg, config_key, default_table, crm_cfg
     )
 
+    feature_index = build_district_feature_index(
+        store_cfg, crm_cfg, district, metric_crs
+    )
+
     groups_map: Dict[str, Dict[str, List[TaskFeature]]] = {}
     for snap in snapshot_rows:
-        feat = lookup_feature_in_project(
-            snap, store_cfg, crm_cfg, district, metric_crs
-        )
+        feat = lookup_feature_in_index(snap, store_cfg, feature_index)
         if feat is None:
             continue
         groups_map.setdefault(snap.group_name, {}).setdefault(

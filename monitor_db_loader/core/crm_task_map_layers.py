@@ -21,6 +21,7 @@ from .config import crm_task_store
 from .crm_snapshot_loader import collect_snapshot_tasks
 from .crm_task_store import (
     enrich_task_result_field_observed,
+    ensure_crm_session_cache,
     filter_sent_tasks_from_result,
 )
 from .crm_tasks import TaskFeature, TaskResult, copy_task_result
@@ -104,6 +105,7 @@ def collect_task_result_for_source(
             raise ValueError("Для активных задач нужен снимок active_result")
         result = copy_task_result(active_result)
         if store_cfg:
+            ensure_crm_session_cache(conn, store_cfg)
             filter_sent_tasks_from_result(result, conn, store_cfg)
         enrich_task_result_field_observed(result, conn, store_cfg)
         result.task_source = source

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """PostgreSQL connection helpers and layer URI building."""
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from qgis.core import QgsDataSourceUri, QgsVectorLayer
@@ -20,6 +21,15 @@ except ImportError:
     psycopg2 = None  # type: ignore
 
 
+@dataclass
+class CrmSessionCache:
+    """In-memory CRM index loaded once per DB session."""
+
+    snapshot_keys: Set[str] = field(default_factory=set)
+    task_index: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    field_observed: Dict[str, Optional[bool]] = field(default_factory=dict)
+
+
 class DatabaseConnection:
     """Holds connection parameters and caches geometry column names."""
 
@@ -34,6 +44,29 @@ class DatabaseConnection:
         self._mixed_loader = MixedGeometryLoader(self)
         self._crm_schema_ready: Set[str] = set()
         self._area_rows_by_rayon: Dict[str, List[Any]] = {}
+        self._crm_session_cache: Optional[CrmSessionCache] = None
+        self._district_wkt_by_rayon: Dict[str, str] = {}
+
+    def get_crm_session_cache(self) -> Optional[CrmSessionCache]:
+        return self._crm_session_cache
+
+    def set_crm_session_cache(self, cache: CrmSessionCache) -> None:
+        self._crm_session_cache = cache
+
+    def invalidate_crm_session_cache(self) -> None:
+        self._crm_session_cache = None
+
+    def get_district_wkt_cache(self, rayon_norm: str) -> Optional[str]:
+        return self._district_wkt_by_rayon.get(rayon_norm)
+
+    def set_district_wkt_cache(self, rayon_norm: str, wkt: str) -> None:
+        self._district_wkt_by_rayon[rayon_norm] = wkt
+
+    def clear_district_wkt_cache(self, rayon_norm: Optional[str] = None) -> None:
+        if rayon_norm is None:
+            self._district_wkt_by_rayon.clear()
+        else:
+            self._district_wkt_by_rayon.pop(rayon_norm, None)
 
     def get_area_rows_cache(self, rayon_norm: str) -> Optional[List[Any]]:
         return self._area_rows_by_rayon.get(rayon_norm)
@@ -47,6 +80,23 @@ class DatabaseConnection:
         else:
             self._area_rows_by_rayon.pop(rayon_norm, None)
 
+    def update_area_row_attrs(
+        self, key: str, attrs_patch: Dict[str, Any], normalize=None
+    ) -> bool:
+        """Обновить атрибуты одной записи tasks_area во всех кэшах района."""
+        key_str = str(key).strip()
+        for rows in self._area_rows_by_rayon.values():
+            for index, (attrs, geom) in enumerate(rows):
+                if str(attrs.get("key", "")).strip() != key_str:
+                    continue
+                merged = dict(attrs)
+                merged.update(attrs_patch)
+                if normalize is not None:
+                    merged = normalize(merged)
+                rows[index] = (merged, geom)
+                return True
+        return False
+
     def close(self):
         if self._pg_conn is not None:
             try:
@@ -56,6 +106,8 @@ class DatabaseConnection:
             self._pg_conn = None
         self._crm_schema_ready.clear()
         self._area_rows_by_rayon.clear()
+        self._crm_session_cache = None
+        self._district_wkt_by_rayon.clear()
 
     def _pg_connect_kwargs(self) -> Dict[str, Any]:
         return {

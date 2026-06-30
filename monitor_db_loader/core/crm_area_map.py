@@ -25,6 +25,7 @@ from .crm_tasks_area import get_area_geometries
 from .crm_ui_constants import normalize_rayon_name
 from .db import DatabaseConnection
 from .layer_utils import refresh_map_canvas
+from .log_util import log_warning
 from .qt_compat import detach_rubber_band
 from .qt_compat import qgs_field
 
@@ -55,6 +56,25 @@ def _area_features_from_result(result: TaskResult) -> List[TaskFeature]:
                 if feat.area_geom and not feat.area_geom.isEmpty():
                     features.append(feat)
     return features
+
+
+def _drawable_area_features(features: List[TaskFeature]) -> List[TaskFeature]:
+    return [
+        feat
+        for feat in features
+        if feat.area_geom and not feat.area_geom.isEmpty()
+    ]
+
+
+def _warn_if_no_drawable_geometries(
+    row_count: int, features: List[TaskFeature], *, context: str
+) -> int:
+    drawable = _drawable_area_features(features)
+    if row_count > 0 and not drawable:
+        log_warning(
+            f"crm.tasks_area: {row_count} записей, геометрия не распарсилась ({context})"
+        )
+    return len(drawable)
 
 
 def _status_color(status: str) -> QColor:
@@ -242,7 +262,9 @@ class TasksAreaMapController:
         from .crm_tasks_area import _rows_to_features
 
         features = _rows_to_features(rows)
-        self._overlay_count = len(features)
+        self._overlay_count = _warn_if_no_drawable_geometries(
+            len(rows), features, context="overlay"
+        )
         layer = _build_memory_layer(OVERLAY_LAYER_NAME, features)
         if layer is None:
             return
@@ -256,7 +278,7 @@ class TasksAreaMapController:
         self._active_layer = None
 
         features = _area_features_from_result(result)
-        self._overlay_count = 0
+        self._overlay_count = len(features)
         layer = _build_memory_layer(ACTIVE_LAYER_NAME, features)
         if layer is None:
             return
@@ -300,7 +322,11 @@ class TasksAreaMapController:
 
         if selected_order and not show_all:
             self.show_selected_order(selected_order, fit=True)
-            self._overlay_count = 1
+            self._overlay_count = (
+                1
+                if selected_order.area_geom and not selected_order.area_geom.isEmpty()
+                else 0
+            )
             refresh_map_canvas(self._iface)
             return
 
@@ -308,7 +334,9 @@ class TasksAreaMapController:
         from .crm_tasks_area import _rows_to_features
 
         features = _rows_to_features(rows)
-        self._overlay_count = len(features)
+        self._overlay_count = _warn_if_no_drawable_geometries(
+            len(rows), features, context="office_orders"
+        )
         layer = _build_memory_layer(OVERLAY_LAYER_NAME, features)
         if layer is None:
             return

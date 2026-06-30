@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsFeature,
     QgsGeometry,
     QgsProject,
@@ -33,6 +34,7 @@ from .district_utils import (
     load_district_boundary,
     resolve_layers,
 )
+from .district_utils import WGS84
 from .log_util import log_info, log_warning
 
 
@@ -187,6 +189,23 @@ def _feature_matches_date_range(
     return date_from <= feat_date <= date_to
 
 
+def _feature_geom_wgs84(
+    layer: QgsVectorLayer, feat: QgsFeature
+) -> Optional[QgsGeometry]:
+    geom = feat.geometry()
+    if not geom or geom.isEmpty():
+        return None
+    out = QgsGeometry(geom)
+    source_crs = layer.crs() if layer.crs().isValid() else WGS84
+    if source_crs.isValid() and WGS84.isValid() and source_crs != WGS84:
+        out.transform(
+            QgsCoordinateTransform(
+                source_crs, WGS84, QgsProject.instance().transformContext()
+            )
+        )
+    return out if not out.isEmpty() else None
+
+
 def _feature_to_task(layer: QgsVectorLayer, feat: QgsFeature) -> TaskFeature:
     attrs = {f.name(): feat[f.name()] for f in feat.fields()}
     return TaskFeature(
@@ -194,6 +213,7 @@ def _feature_to_task(layer: QgsVectorLayer, feat: QgsFeature) -> TaskFeature:
         layer_name=layer.name(),
         feature_id=feat.id(),
         attributes=attrs,
+        task_geom=_feature_geom_wgs84(layer, feat),
     )
 
 
@@ -613,43 +633,53 @@ def run_get_task(
         )
 
         task_result.task_source = initial_source
-        db_conn = _persist_tasks_to_db(
-            config,
-            task_result,
-            parent or iface.mainWindow(),
-            db_conn=db_conn,
-            user_session=user_session,
-        )
+        office_role = role == "office"
 
-        if db_conn is not None:
-            from .crm_field_data import append_field_data_to_result
-            from .crm_office_data import append_office_data_to_result
+        if office_role:
+            if db_conn is None:
+                db_conn = connect_db(config)
+            log_info(
+                "Получить задачу (office): запись в crm.tasks отложена — "
+                "кнопка «Синхронизировать задачи района»"
+            )
+        else:
+            db_conn = _persist_tasks_to_db(
+                config,
+                task_result,
+                parent or iface.mainWindow(),
+                db_conn=db_conn,
+                user_session=user_session,
+            )
 
-            store_cfg = crm_task_store(config)
-            metric_srid = metric_crs.postgisSrid()
-            if metric_srid <= 0:
-                auth = metric_crs.authid() or ""
-                if auth.upper().startswith("EPSG:"):
-                    try:
-                        metric_srid = int(auth.split(":", 1)[1])
-                    except ValueError:
+            if db_conn is not None:
+                from .crm_field_data import append_field_data_to_result
+                from .crm_office_data import append_office_data_to_result
+
+                store_cfg = crm_task_store(config)
+                metric_srid = metric_crs.postgisSrid()
+                if metric_srid <= 0:
+                    auth = metric_crs.authid() or ""
+                    if auth.upper().startswith("EPSG:"):
+                        try:
+                            metric_srid = int(auth.split(":", 1)[1])
+                        except ValueError:
+                            metric_srid = 32637
+                    else:
                         metric_srid = 32637
-                else:
-                    metric_srid = 32637
-            append_field_data_to_result(
-                task_result,
-                db_conn,
-                district,
-                store_cfg,
-                metric_srid,
-            )
-            append_office_data_to_result(
-                task_result,
-                db_conn,
-                district,
-                store_cfg,
-                metric_srid,
-            )
+                append_field_data_to_result(
+                    task_result,
+                    db_conn,
+                    district,
+                    store_cfg,
+                    metric_srid,
+                )
+                append_office_data_to_result(
+                    task_result,
+                    db_conn,
+                    district,
+                    store_cfg,
+                    metric_srid,
+                )
 
     if db_conn is not None:
         from .crm_tasks_area import preload_area_geometries

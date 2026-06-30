@@ -14,12 +14,13 @@ from qgis.core import QgsGeometry
 from .crm_task_store import (
     TASK_ID_COLUMNS,
     _pg_connection,
-    fetch_snapshot_task_keys,
+    get_snapshot_task_keys,
 )
 from .crm_tasks import TaskFeature, TaskGroup, TaskResult, TaskSubgroup
 from .crm_ui_constants import (
     FIELD_DATA_LAYER_KEY,
     FIELD_DATA_SUBGROUP,
+    normalize_rayon_name,
 )
 from .db import DatabaseConnection
 from .district_utils import DistrictBoundary
@@ -38,6 +39,11 @@ def fetch_district_wkt_db(
     field: str = "rayon",
 ) -> Optional[str]:
     """WKT полигона района из PostGIS (как в WEBCRM fetch_district_wkt)."""
+    rayon_norm = normalize_rayon_name(rayon)
+    cached = conn.get_district_wkt_cache(rayon_norm)
+    if cached:
+        return cached
+
     pg = _pg_connection(conn)
     if pg is None:
         return None
@@ -56,7 +62,9 @@ def fetch_district_wkt_db(
             row = cur.fetchone()
         pg.commit()
         if row and row[0]:
-            return str(row[0])
+            wkt = str(row[0])
+            conn.set_district_wkt_cache(rayon_norm, wkt)
+            return wkt
     except Exception as exc:
         _pg_rollback(pg)
         log_warning(f"Не удалось загрузить полигон района «{rayon}»: {exc}")
@@ -305,7 +313,7 @@ def collect_field_data_tasks(
           )
     """
 
-    snapshot_keys = fetch_snapshot_task_keys(conn, store_cfg)
+    snapshot_keys = get_snapshot_task_keys(conn, store_cfg)
     features: List[TaskFeature] = []
 
     _pg_recover_transaction(pg)

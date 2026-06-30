@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Диалог списка задач CRM по району."""
 
+import time
 from typing import List, Optional, Tuple
 
 from qgis.core import (
@@ -13,6 +14,7 @@ from qgis.core import (
 from qgis.gui import QgsHighlight
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -44,9 +46,12 @@ from ..core.crm_task_map_layers import (
 )
 from ..core.crm_task_store import (
     enrich_task_result_field_observed,
+    ensure_all_snapshot_tables,
+    ensure_crm_session_cache,
     fetch_task_by_key,
     fetch_task_for_feature,
     filter_sent_tasks_from_result,
+    persist_task_result,
 )
 from ..core.crm_tasks import (
     TaskFeature,
@@ -84,7 +89,7 @@ from ..core.crm_ui_constants import (
 from ..core.db import DatabaseConnection
 from ..core.district_utils import DistrictBoundary
 from ..core.layer_utils import refresh_map_canvas
-from ..core.log_util import log_warning
+from ..core.log_util import log_info, log_timing, log_warning
 from ..core.task_dxf_export import export_tasks_to_dxf, export_tasks_to_shp
 from ..core.qt_compat import TEXT_FORMAT_RICH, register_modeless_dialog, show_modeless_dialog
 from .crm_source_tabs import TaskSourceTabs
@@ -143,6 +148,8 @@ class TaskDialog(QDialog):
         self._busy = False
         self._office_area_order: Optional[TaskFeature] = None
         self._office_full_result: Optional[TaskResult] = None
+        self._office_filtered_result: Optional[TaskResult] = None
+        self._office_filtered_key: Optional[str] = None
         self._office_orders_on_map = False
         self._office_picker: Optional[AreaOrderPickerDialog] = None
         self._place_point_mode = False
@@ -197,6 +204,7 @@ class TaskDialog(QDialog):
         self._source_tabs.completeOrderClicked.connect(self._on_complete_office_order)
         self._source_tabs.ordersToggleClicked.connect(self._on_office_orders_toggle)
         self._source_tabs.selectOrderClicked.connect(self._open_office_order_picker)
+        self._source_tabs.syncDistrictClicked.connect(self._on_sync_district_tasks)
         self._source_tabs.placePointClicked.connect(self._on_toggle_place_point)
         layout.addWidget(self._source_tabs)
 
@@ -277,6 +285,9 @@ class TaskDialog(QDialog):
         footer.addWidget(self._close_btn)
         layout.addLayout(footer)
 
+        if self._is_office_user():
+            self._create_layers_btn.hide()
+
         self._update_header()
         if (
             self._task_source != "active"
@@ -318,18 +329,48 @@ class TaskDialog(QDialog):
             and self._office_area_order is None
         )
 
+    def _office_order_key(self, order: Optional[TaskFeature]) -> Optional[str]:
+        if order is None:
+            return None
+        key = order.task_key or order.attributes.get("key")
+        return str(key).strip() if key else None
+
+    def _invalidate_office_filter_cache(self) -> None:
+        self._office_filtered_result = None
+        self._office_filtered_key = None
+
+    def _rebuild_office_filter_cache(self) -> None:
+        if not self._office_working() or not self._office_full_result:
+            self._invalidate_office_filter_cache()
+            return
+        key = self._office_order_key(self._office_area_order)
+        if not key:
+            self._invalidate_office_filter_cache()
+            return
+        if self._office_filtered_key == key and self._office_filtered_result:
+            return
+        t0 = time.perf_counter()
+        self._office_filtered_result = filter_task_result_by_area(
+            self._office_full_result, self._office_area_order
+        )
+        self._office_filtered_key = key
+        log_timing("office_filter_cache_rebuild", (time.perf_counter() - t0) * 1000)
+
     def _office_remaining_count(self) -> int:
         if not self._office_working() or not self._office_full_result:
             return 0
-        filtered = filter_task_result_by_area(
-            self._office_full_result, self._office_area_order
-        )
-        return count_task_result_features(filtered)
+        self._rebuild_office_filter_cache()
+        if self._office_filtered_result:
+            return count_task_result_features(self._office_filtered_result)
+        return 0
 
     def _view_result(self) -> TaskResult:
         if self._office_awaiting_order() and self._office_full_result:
             return empty_task_result_shell(self._office_full_result)
         if self._office_working() and self._office_full_result and self._office_area_order:
+            self._rebuild_office_filter_cache()
+            if self._office_filtered_result:
+                return self._office_filtered_result
             return filter_task_result_by_area(
                 self._office_full_result, self._office_area_order
             )
@@ -338,14 +379,20 @@ class TaskDialog(QDialog):
     def _sync_office_display(self) -> None:
         if not self._is_office_user() or self._task_source != "active":
             self._result = self._office_full_result or self._result
+            self._invalidate_office_filter_cache()
             return
         if self._office_area_order is None:
             base = self._office_full_result or self._result
             self._result = empty_task_result_shell(base)
+            self._invalidate_office_filter_cache()
         else:
-            self._result = filter_task_result_by_area(
-                self._office_full_result or self._result,
-                self._office_area_order,
+            self._rebuild_office_filter_cache()
+            self._result = (
+                self._office_filtered_result
+                or filter_task_result_by_area(
+                    self._office_full_result or self._result,
+                    self._office_area_order,
+                )
             )
 
     def _load_area_orders(self) -> List[TaskFeature]:
@@ -386,10 +433,6 @@ class TaskDialog(QDialog):
                 self._on_office_order_selected(selected)
         self._office_picker = None
 
-    def _office_order_key(self, order: TaskFeature) -> Optional[str]:
-        key = order.task_key or order.attributes.get("key")
-        return str(key).strip() if key else None
-
     def _on_office_order_selected(self, order: TaskFeature) -> None:
         key = self._office_order_key(order)
         if not key:
@@ -416,10 +459,6 @@ class TaskDialog(QDialog):
                     "Не удалось начать анализ заказа.",
                 )
                 return
-            try:
-                preload_area_geometries(conn, self._result.district_name)
-            except Exception:
-                pass
             refreshed_orders = self._load_area_orders()
             for item in refreshed_orders:
                 item_key = self._office_order_key(item)
@@ -428,19 +467,187 @@ class TaskDialog(QDialog):
                     break
             self._office_area_order = order
             self._office_orders_on_map = False
-            self._sync_office_display()
-            self._populate_tree()
-            self._clear_row_selection()
-            first = self._first_subgroup_item()
-            if first:
-                self.tree.setCurrentItem(first)
-            else:
-                self._fill_table(None)
-            self._refresh_area_map()
-            self._update_status()
+            self._invalidate_office_filter_cache()
+            self._apply_office_order_filter(order)
         finally:
             self._busy = False
             self._update_office_actions()
+
+    def _order_has_area_geom(self, order: Optional[TaskFeature]) -> bool:
+        if order is None:
+            return False
+        geom = order.area_geom
+        return geom is not None and not geom.isEmpty()
+
+    def _apply_office_order_filter(self, order: TaskFeature) -> None:
+        """Пространственный фильтр в UI-потоке (QgsGeometry не потокобезопасен)."""
+        self.status_label.setText("Фильтрация задач по полигону заказа…")
+        QApplication.processEvents()
+
+        full_count = (
+            count_task_result_features(self._office_full_result)
+            if self._office_full_result
+            else 0
+        )
+        order_geom = self._order_has_area_geom(order)
+
+        if not self._office_full_result:
+            self._sync_office_display()
+            self._apply_office_order_ui()
+            self.status_label.setText(
+                "В районе нет активных задач. "
+                "Нажмите «Синхронизировать задачи района»."
+            )
+            log_info(
+                f"office filter: full=0 filtered=0 order_geom={'yes' if order_geom else 'no'}"
+            )
+            return
+
+        try:
+            self._rebuild_office_filter_cache()
+            self._sync_office_display()
+        except Exception as exc:
+            log_warning(f"Фильтрация office-заказа: {exc}")
+            self._sync_office_display()
+
+        filtered_count = count_task_result_features(self._result)
+        log_info(
+            f"office filter: full={full_count} filtered={filtered_count} "
+            f"order_geom={'yes' if order_geom else 'no'}"
+        )
+
+        self._apply_office_order_ui()
+
+        if full_count == 0:
+            self.status_label.setText(
+                "В районе нет активных задач. "
+                "Нажмите «Синхронизировать задачи района»."
+            )
+        elif not order_geom:
+            self.status_label.setText(
+                "Не удалось загрузить полигон заказа. "
+                "Проверьте журнал QGIS (crm.tasks_area)."
+            )
+        elif filtered_count == 0:
+            self.status_label.setText(
+                f"В полигоне заказа активных задач не найдено (в районе: {full_count})."
+            )
+
+    def _apply_office_order_ui(self) -> None:
+        self._populate_tree()
+        self._clear_row_selection()
+        first = self._first_subgroup_item()
+        if first:
+            self.tree.setCurrentItem(first)
+        else:
+            self._fill_table(None)
+        self._refresh_area_map()
+        self._update_status()
+
+    def _metric_srid(self) -> int:
+        cfg = crm_tasks(self._config) if self._config else {}
+        metric_crs_name = cfg.get("metric_crs", "EPSG:32637")
+        from qgis.core import QgsCoordinateReferenceSystem
+
+        metric_crs = QgsCoordinateReferenceSystem(metric_crs_name)
+        metric_srid = metric_crs.postgisSrid()
+        if metric_srid <= 0:
+            auth = metric_crs.authid() or ""
+            if auth.upper().startswith("EPSG:"):
+                try:
+                    metric_srid = int(auth.split(":", 1)[1])
+                except ValueError:
+                    metric_srid = 32637
+            else:
+                metric_srid = 32637
+        return metric_srid
+
+    def _on_sync_district_tasks(self) -> None:
+        if not self._is_office_user() or not self._config or not self._district:
+            QMessageBox.warning(
+                self,
+                "Monitor CRM",
+                "Синхронизация недоступна: нужны конфигурация и район.",
+            )
+            return
+        conn = self._get_db_connection()
+        if conn is None:
+            return
+
+        source_result = (
+            self._office_full_result or self._active_result or self._result
+        )
+        progress = QProgressDialog(
+            "Синхронизация задач района…", None, 0, 0, self
+        )
+        progress.setWindowTitle("Monitor CRM")
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        try:
+            from ..core.crm_field_data import append_field_data_to_result
+            from ..core.crm_office_data import append_office_data_to_result
+
+            ensure_all_snapshot_tables(conn, self._store_cfg)
+            login = self._current_user_login()
+            stats = persist_task_result(
+                conn, source_result, self._store_cfg, login
+            )
+            ensure_crm_session_cache(conn, self._store_cfg, force_reload=True)
+            metric_srid = self._metric_srid()
+            append_field_data_to_result(
+                source_result,
+                conn,
+                self._district,
+                self._store_cfg,
+                metric_srid,
+            )
+            append_office_data_to_result(
+                source_result,
+                conn,
+                self._district,
+                self._store_cfg,
+                metric_srid,
+            )
+
+            self._office_full_result = copy_task_result(source_result)
+            self._active_result = copy_task_result(source_result)
+            self._invalidate_office_filter_cache()
+            self._apply_snapshot_filter()
+
+            layer_stats = create_task_layers_in_qgis(
+                self._iface,
+                conn,
+                self._district,
+                self._config,
+                self._allowed_sources,
+                active_result=self._active_result,
+                parent=self,
+            )
+
+            lines = [
+                f"Добавлено в crm.tasks: {stats.inserted}",
+                f"Уже в БД: {stats.skipped}",
+                f"Без ID: {stats.invalid}",
+                f"Слоёв QGIS: {layer_stats.layers_created}",
+                f"Объектов на слоях: {layer_stats.features_added}",
+            ]
+            if layer_stats.warnings:
+                lines.append("")
+                lines.extend(f"• {w}" for w in layer_stats.warnings)
+            QMessageBox.information(
+                self,
+                "Monitor CRM — синхронизация",
+                "Синхронизация задач района завершена.\n\n" + "\n".join(lines),
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Monitor CRM — синхронизация",
+                f"Не удалось синхронизировать задачи района:\n{exc}",
+            )
+        finally:
+            progress.close()
 
     def _on_pause_office_order(self) -> None:
         if not self._office_working():
@@ -463,6 +670,7 @@ class TaskDialog(QDialog):
                 return
             self._office_area_order = None
             self._office_orders_on_map = False
+            self._invalidate_office_filter_cache()
             self._sync_office_display()
             self._populate_tree()
             self._clear_row_selection()
@@ -821,12 +1029,17 @@ class TaskDialog(QDialog):
     def _apply_snapshot_filter(self) -> None:
         if not self._db_conn or not self._store_cfg:
             return
+        try:
+            ensure_crm_session_cache(self._db_conn, self._store_cfg)
+        except Exception as exc:
+            log_warning(f"CRM cache: {exc}")
         filter_sent_tasks_from_result(self._result, self._db_conn, self._store_cfg)
         self._enrich_field_observed()
         if self._task_source == "active":
             self._active_result = copy_task_result(self._result)
             if self._is_office_user():
                 self._office_full_result = copy_task_result(self._result)
+                self._invalidate_office_filter_cache()
                 if self._office_area_order is None:
                     self._sync_office_display()
         self._populate_tree()
@@ -1216,6 +1429,7 @@ class TaskDialog(QDialog):
             )
             if source == "active" and self._is_office_user():
                 self._office_full_result = copy_task_result(self._result)
+                self._invalidate_office_filter_cache()
                 if self._office_area_order:
                     self._sync_office_display()
                 else:

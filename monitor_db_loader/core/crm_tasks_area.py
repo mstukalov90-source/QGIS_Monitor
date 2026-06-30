@@ -73,12 +73,45 @@ ANALISE_AUDIT_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("analise_paused_at", "TIMESTAMPTZ"),
 )
 
+_TASKS_AREA_INDEXES = (
+    """
+    CREATE INDEX IF NOT EXISTS idx_tasks_area_rayon
+        ON crm.tasks_area (rayon) WHERE geom IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_tasks_area_geom
+        ON crm.tasks_area USING GIST (geom)
+    """,
+)
+
+_tasks_area_indexes_ready: set[str] = set()
 _analise_audit_ready: set[str] = set()
 
 AreaGeometryRow = Tuple[Dict[str, Any], Optional[QgsGeometry]]
 
 TASKS_AREA_SCHEMA = "crm"
 TASKS_AREA_TABLE = "tasks_area"
+
+
+def ensure_tasks_area_indexes(conn: DatabaseConnection) -> bool:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+    key = f"{TASKS_AREA_SCHEMA}.{TASKS_AREA_TABLE}.indexes"
+    if key in _tasks_area_indexes_ready:
+        return True
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            for stmt in _TASKS_AREA_INDEXES:
+                cur.execute(stmt)
+        pg.commit()
+        _tasks_area_indexes_ready.add(key)
+        return True
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось создать индексы crm.tasks_area: {exc}")
+        return False
 
 
 def ensure_analise_audit_columns(conn: DatabaseConnection) -> bool:
@@ -120,10 +153,20 @@ def ensure_tasks_area_audit_columns(conn: DatabaseConnection) -> bool:
         return False
 
 
-def _geometry_from_row(geom_wkb, geom_wkt) -> Optional[QgsGeometry]:
+def _geometry_from_row(
+    geom_wkb,
+    geom_wkt,
+    *,
+    row_hint: Optional[Dict[str, Any]] = None,
+) -> Optional[QgsGeometry]:
     if geom_wkb is not None:
         try:
-            geom = QgsGeometry.fromWkb(bytes(geom_wkb))
+            raw = (
+                geom_wkb
+                if isinstance(geom_wkb, (bytes, bytearray))
+                else bytes(geom_wkb)
+            )
+            geom = QgsGeometry.fromWkb(raw)
             if geom and not geom.isEmpty():
                 return geom
         except Exception:
@@ -135,7 +178,39 @@ def _geometry_from_row(geom_wkb, geom_wkt) -> Optional[QgsGeometry]:
                 return geom
         except Exception:
             pass
+    if row_hint is not None and (geom_wkb is not None or geom_wkt):
+        key = row_hint.get("key") or "?"
+        fid = row_hint.get("fid") or "?"
+        log_warning(
+            f"crm.tasks_area: не удалось распарсить geom (key={key}, fid={fid})"
+        )
     return None
+
+
+def _count_valid_geometries(rows: List[AreaGeometryRow]) -> int:
+    return sum(
+        1
+        for _attrs, geom in rows
+        if geom is not None and not geom.isEmpty()
+    )
+
+
+def _log_area_geometry_stats(
+    rows: List[AreaGeometryRow],
+    rayon_norm: str,
+    *,
+    status: Optional[str] = None,
+) -> None:
+    geom_ok = _count_valid_geometries(rows)
+    geom_fail = len(rows) - geom_ok
+    log_info(
+        f"crm.tasks_area: rows={len(rows)} geom_ok={geom_ok} geom_fail={geom_fail} "
+        f"(район «{rayon_norm}», status={status or 'all'})"
+    )
+    if geom_fail > 0:
+        log_warning(
+            f"crm.tasks_area: {geom_fail} записей без геометрии (район «{rayon_norm}»)"
+        )
 
 
 def _normalize_area_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
@@ -180,6 +255,7 @@ def fetch_tasks_area_geometries(
         return []
 
     rayon_norm = normalize_rayon_name(rayon)
+    ensure_tasks_area_indexes(conn)
     filters = ['"geom" IS NOT NULL', '"rayon" = %s']
     params: List[Any] = [rayon_norm]
     if status:
@@ -194,8 +270,8 @@ def fetch_tasks_area_geometries(
                analise_started_by, analise_started_at,
                analise_finished_by, analise_finished_at,
                analise_paused_by, analise_paused_at,
-               ST_AsBinary(geom) AS geom_wkb,
-               ST_AsText(geom) AS geom_wkt
+               ST_AsBinary(ST_Transform(geom, 4326)) AS geom_wkb,
+               ST_AsText(ST_Transform(geom, 4326)) AS geom_wkt
         FROM crm.tasks_area
         WHERE {where}
         ORDER BY loaded_at DESC NULLS LAST
@@ -213,13 +289,12 @@ def fetch_tasks_area_geometries(
                 geom_wkb = data.pop("geom_wkb", None)
                 geom_wkt = data.pop("geom_wkt", None)
                 attrs = _normalize_area_attrs(data)
-                geom = _geometry_from_row(geom_wkb, geom_wkt)
+                geom = _geometry_from_row(
+                    geom_wkb, geom_wkt, row_hint=attrs
+                )
                 rows.append((attrs, geom))
         pg.commit()
-        log_info(
-            f"crm.tasks_area: загружено {len(rows)} записей "
-            f"(район «{rayon_norm}», status={status or 'all'})"
-        )
+        _log_area_geometry_stats(rows, rayon_norm, status=status)
     except Exception as exc:
         _pg_rollback(pg)
         log_warning(f"Не удалось загрузить crm.tasks_area: {exc}")
@@ -233,8 +308,19 @@ def preload_area_geometries(
     rayon_norm = normalize_rayon_name(rayon)
     rows = fetch_tasks_area_geometries(conn, rayon=rayon_norm, status=None, limit=limit)
     conn.set_area_rows_cache(rayon_norm, rows)
-    log_info(f"crm.tasks_area: кэш района «{rayon_norm}» — {len(rows)} полигонов")
-    return len(rows)
+    geom_ok = _count_valid_geometries(rows)
+    log_info(
+        f"crm.tasks_area: кэш района «{rayon_norm}» — "
+        f"{geom_ok} полигонов из {len(rows)} записей"
+    )
+    return geom_ok
+
+
+def _refresh_area_cache_row(conn: DatabaseConnection, key: str) -> None:
+    state = _fetch_analise_state(conn, key)
+    if state is None:
+        return
+    conn.update_area_row_attrs(key, state, normalize=_normalize_area_attrs)
 
 
 def invalidate_area_geometries_cache(
@@ -256,7 +342,13 @@ def get_area_geometries(
     rayon_norm = normalize_rayon_name(rayon)
     cached = conn.get_area_rows_cache(rayon_norm)
     if cached is not None:
-        return _filter_rows_by_status(cached, status)
+        if cached and _count_valid_geometries(cached) == 0:
+            log_warning(
+                f"crm.tasks_area: кэш района «{rayon_norm}» без геометрии — перезагрузка"
+            )
+            conn.clear_area_rows_cache(rayon_norm)
+        else:
+            return _filter_rows_by_status(cached, status)
 
     if status:
         return fetch_tasks_area_geometries(
@@ -428,7 +520,7 @@ def start_area_analise(
                 row = cur.fetchone()
             pg.commit()
             if row:
-                invalidate_area_geometries_cache(conn)
+                _refresh_area_cache_row(conn, key)
                 from .crm_statistics import log_statistic
 
                 log_statistic(
@@ -469,7 +561,7 @@ def start_area_analise(
                 row = cur.fetchone()
             pg.commit()
             if row:
-                invalidate_area_geometries_cache(conn)
+                _refresh_area_cache_row(conn, key)
                 from .crm_statistics import log_statistic
 
                 log_statistic(
@@ -524,7 +616,7 @@ def pause_area_analise(
             row = cur.fetchone()
         pg.commit()
         if row:
-            invalidate_area_geometries_cache(conn)
+            _refresh_area_cache_row(conn, key)
             from .crm_statistics import log_statistic
 
             log_statistic(
@@ -600,7 +692,10 @@ def complete_area_analise(
             row = cur.fetchone()
         pg.commit()
         if row:
-            invalidate_area_geometries_cache(conn)
+            _refresh_area_cache_row(conn, key)
+            conn.update_area_row_attrs(
+                key, {"analise": True}, normalize=_normalize_area_attrs
+            )
             from .crm_statistics import log_statistic
 
             log_statistic(
@@ -675,7 +770,9 @@ def _transition_area_status(
             row = cur.fetchone()
         pg.commit()
         if row:
-            invalidate_area_geometries_cache(conn)
+            conn.update_area_row_attrs(
+                key, {"status": to_status}, normalize=_normalize_area_attrs
+            )
             _log_area_status_change(
                 conn,
                 key=key,

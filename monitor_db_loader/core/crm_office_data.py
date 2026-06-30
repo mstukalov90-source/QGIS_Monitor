@@ -15,7 +15,7 @@ from .crm_field_data import (
     _pg_rollback,
     fetch_district_wkt_db,
 )
-from .crm_task_store import CRM_GROUP_DISRUPTIONS, _pg_connection, fetch_snapshot_task_keys
+from .crm_task_store import CRM_GROUP_DISRUPTIONS, _pg_connection, get_snapshot_task_keys
 from .crm_tasks import TaskFeature, TaskGroup, TaskResult, TaskSubgroup
 from .crm_ui_constants import OFFICE_DATA_LAYER_KEY, OFFICE_DATA_SUBGROUP
 from .db import DatabaseConnection
@@ -116,7 +116,7 @@ def collect_office_data_tasks(
           )
     """
 
-    snapshot_keys = fetch_snapshot_task_keys(conn, store_cfg)
+    snapshot_keys = get_snapshot_task_keys(conn, store_cfg)
     features: List[TaskFeature] = []
 
     _pg_recover_transaction(pg)

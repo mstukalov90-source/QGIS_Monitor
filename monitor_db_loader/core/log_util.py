@@ -16,3 +16,11 @@ def log_warning(message: str) -> None:
 
 def log_critical(message: str) -> None:
     QgsMessageLog.logMessage(message, LOG_CHANNEL, Qgis.Critical)
+
+
+def log_timing(label: str, elapsed_ms: float) -> None:
+    QgsMessageLog.logMessage(
+        f"[timing] {label}: {elapsed_ms:.1f} ms",
+        LOG_CHANNEL,
+        Qgis.Info,
+    )

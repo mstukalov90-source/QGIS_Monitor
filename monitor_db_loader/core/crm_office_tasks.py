@@ -138,4 +138,5 @@ def create_office_task(
     record = fetch_task_by_key(conn, store_cfg, task_key)
     if record is None:
         raise RuntimeError("Office-задача не найдена после создания")
+    conn.invalidate_crm_session_cache()
     return record

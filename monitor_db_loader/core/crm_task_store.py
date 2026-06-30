@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from .crm_ui_constants import FIELD_DATA_SUBGROUP, OFFICE_DATA_SUBGROUP
-from .db import DatabaseConnection
+from .db import CrmSessionCache, DatabaseConnection
 from .log_util import log_info, log_warning
 
 try:
@@ -363,6 +363,38 @@ def _relation_kind(pg, schema: str, table: str) -> Optional[str]:
         return None
 
 
+_TASKS_LOOKUP_INDEXES = tuple(
+    f"""
+    CREATE INDEX IF NOT EXISTS idx_tasks_{col}
+        ON crm.tasks ("{col}") WHERE "{col}" IS NOT NULL
+    """
+    for col in TASK_ID_COLUMNS
+)
+
+_tasks_lookup_indexes_ready: Set[str] = set()
+
+
+def ensure_tasks_lookup_indexes(conn: DatabaseConnection) -> bool:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+    key = "crm.tasks.lookup_indexes"
+    if key in _tasks_lookup_indexes_ready:
+        return True
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            for stmt in _TASKS_LOOKUP_INDEXES:
+                cur.execute(stmt)
+        pg.commit()
+        _tasks_lookup_indexes_ready.add(key)
+        return True
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось создать индексы lookup crm.tasks: {exc}")
+        return False
+
+
 def ensure_tasks_table(conn: DatabaseConnection) -> bool:
     """Создать схему crm и таблицу tasks при отсутствии."""
     global _last_tasks_ensure_error
@@ -404,6 +436,7 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
                 cache.add(indexes_dropped_key)
         pg.commit()
         cache.add(cache_key)
+        ensure_tasks_lookup_indexes(conn)
         log_info("Таблица crm.tasks проверена/создана")
         return True
     except Exception as exc:
@@ -816,6 +849,93 @@ def fetch_field_observed_by_keys(
     return result
 
 
+def load_crm_session_cache(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> CrmSessionCache:
+    """Загрузить индекс crm.tasks и ключи snapshot-таблиц (2 SQL-запроса)."""
+    import time
+
+    from .log_util import log_timing
+
+    t0 = time.perf_counter()
+    cache = CrmSessionCache()
+    schema, table = _table_ref(store_cfg)
+    pg = _pg_connection(conn)
+    if pg is None:
+        conn.set_crm_session_cache(cache)
+        return cache
+
+    col_list = ", ".join(
+        f'"{col}"' for col in ("key",) + TASK_ID_COLUMNS + ("field_observed",)
+    )
+    tasks_query = f'SELECT {col_list} FROM "{schema}"."{table}"'
+
+    union_parts: List[str] = []
+    for config_key, default_table in _SNAPSHOT_TABLES:
+        snap_schema, snap_table = _snapshot_table_ref(
+            store_cfg, config_key, default_table
+        )
+        union_parts.append(
+            f'SELECT task_key::text FROM "{snap_schema}"."{snap_table}"'
+        )
+    snapshots_query = " UNION ALL ".join(union_parts)
+
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(tasks_query)
+            for row in cur.fetchall():
+                key = str(row[0])
+                for col_index, col in enumerate(TASK_ID_COLUMNS, start=1):
+                    value = _normalize_id_value(row[col_index])
+                    if value:
+                        cache.task_index[(col, value)] = key
+                observed = row[len(TASK_ID_COLUMNS) + 1]
+                cache.field_observed[key] = (
+                    bool(observed) if observed is not None else None
+                )
+            cur.execute(snapshots_query)
+            for row in cur.fetchall():
+                if row[0]:
+                    cache.snapshot_keys.add(str(row[0]))
+        pg.commit()
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось загрузить CRM session cache: {exc}")
+
+    conn.set_crm_session_cache(cache)
+    log_timing("load_crm_session_cache", (time.perf_counter() - t0) * 1000)
+    log_info(
+        f"CRM cache: tasks={len(cache.field_observed)}, "
+        f"snapshots={len(cache.snapshot_keys)}, "
+        f"index={len(cache.task_index)}"
+    )
+    return cache
+
+
+def ensure_crm_session_cache(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    *,
+    force_reload: bool = False,
+) -> CrmSessionCache:
+    cache = conn.get_crm_session_cache()
+    if cache is not None and not force_reload:
+        return cache
+    return load_crm_session_cache(conn, store_cfg)
+
+
+def get_snapshot_task_keys(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+) -> Set[str]:
+    cache = conn.get_crm_session_cache()
+    if cache is not None:
+        return cache.snapshot_keys
+    return fetch_snapshot_task_keys(conn, store_cfg)
+
+
 def enrich_task_result_field_observed(
     task_result,
     conn: DatabaseConnection,
@@ -824,8 +944,9 @@ def enrich_task_result_field_observed(
     """Заполнить attributes['field_observed'] и task_key для списков заказов."""
     from .crm_ui_constants import AREA_LAYER_KEY
 
-    task_index = fetch_task_keys_index(conn, store_cfg)
-    observed_map = fetch_all_field_observed(conn, store_cfg)
+    cache = ensure_crm_session_cache(conn, store_cfg)
+    task_index = cache.task_index
+    observed_map = cache.field_observed
 
     for group in task_result.groups:
         for subgroup in group.subgroups:
@@ -853,11 +974,12 @@ def filter_sent_tasks_from_result(
     store_cfg: Dict[str, Any],
 ) -> int:
     """Скрыть задачи, уже отправленные в field/done_* таблицы. Возвращает число скрытых."""
-    snapshot_keys = fetch_snapshot_task_keys(conn, store_cfg)
+    cache = ensure_crm_session_cache(conn, store_cfg)
+    snapshot_keys = cache.snapshot_keys
     if not snapshot_keys:
         return 0
 
-    task_index = fetch_task_keys_index(conn, store_cfg)
+    task_index = cache.task_index
     hidden = 0
 
     for group in task_result.groups:
@@ -934,6 +1056,11 @@ def send_task_snapshot(
             cur.execute(query, values)
         pg.commit()
         log_info(f"crm.{table}: отправлена задача {record.key}")
+        cache = conn.get_crm_session_cache()
+        if cache is not None:
+            cache.snapshot_keys.add(str(record.key))
+        else:
+            conn.invalidate_crm_session_cache()
         if config_key in _SNAPSHOT_STAT_ACTIONS:
             from .crm_statistics import log_statistic
 
@@ -1220,33 +1347,42 @@ def persist_task_result(
 
     _pg_recover_transaction(pg)
     try:
+        to_insert: List[Dict[str, Any]] = []
+        cache = ensure_crm_session_cache(conn, store_cfg)
+        task_index = cache.task_index
+
+        for group in task_result.groups:
+            for subgroup in group.subgroups:
+                for task_feat in subgroup.features:
+                    row = task_row_from_feature(
+                        group.name,
+                        subgroup.name,
+                        task_feat.attributes,
+                        store_cfg,
+                    )
+                    if row is None:
+                        stats.invalid += 1
+                        continue
+
+                    task_column = next(
+                        col for col in TASK_ID_COLUMNS if row[col] is not None
+                    )
+                    business_id = row[task_column]
+
+                    if (task_column, business_id) in task_index:
+                        stats.skipped += 1
+                        continue
+
+                    to_insert.append(row)
+
         with pg.cursor() as cur:
-            for group in task_result.groups:
-                for subgroup in group.subgroups:
-                    for task_feat in subgroup.features:
-                        row = task_row_from_feature(
-                            group.name,
-                            subgroup.name,
-                            task_feat.attributes,
-                            store_cfg,
-                        )
-                        if row is None:
-                            stats.invalid += 1
-                            continue
-
-                        task_column = next(
-                            col for col in TASK_ID_COLUMNS if row[col] is not None
-                        )
-                        business_id = row[task_column]
-
-                        if _task_exists(cur, schema, table, task_column, business_id):
-                            stats.skipped += 1
-                            continue
-
-                        _insert_task(cur, schema, table, row, login)
-                        stats.inserted += 1
+            for row in to_insert:
+                _insert_task(cur, schema, table, row, login)
+                stats.inserted += 1
 
         pg.commit()
+        if stats.inserted:
+            conn.invalidate_crm_session_cache()
         log_info(
             f"crm.tasks: добавлено {stats.inserted}, "
             f"пропущено {stats.skipped}, без ID {stats.invalid}"
