@@ -21,7 +21,11 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
-from ..core.crm_office_link_prefill import office_task_link_prefill
+from ..core.crm_office_link_prefill import (
+    can_add_office_point_from_task,
+    office_task_link_prefill,
+    office_task_link_prefill_from_record,
+)
 from ..core.crm_pick import LinkPickBundle, resolve_link_pick_bundle
 from ..core.crm_task_store import (
     CRM_GROUP_ORDERS,
@@ -318,10 +322,14 @@ class TaskEditDialog(QDialog):
         )
         self._view_field_materials_btn.clicked.connect(self._on_view_field_materials)
         manage_row.addWidget(self._view_field_materials_btn)
-        self._add_office_point_btn = QPushButton("Добавить точку камерального анализа")
+        self._add_office_point_btn = QPushButton("Добавить разрытие на карте")
         self._add_office_point_btn.setVisible(
-            self._office_working
-            and self._group_name == CRM_GROUP_ORDERS
+            can_add_office_point_from_task(
+                office_working=self._office_working,
+                task_source=self._task_source,
+                subgroup_name=self._subgroup_name or "",
+                record=self._record,
+            )
             and self._on_start_place_office_point is not None
         )
         self._add_office_point_btn.clicked.connect(self._on_add_office_point)
@@ -441,10 +449,12 @@ class TaskEditDialog(QDialog):
     def _on_add_office_point(self) -> None:
         if not self._on_start_place_office_point:
             return
-        prefill = office_task_link_prefill(
-            self._subgroup_name or "",
-            self._feature_attributes,
-        )
+        prefill = office_task_link_prefill_from_record(self._record)
+        if not prefill:
+            prefill = office_task_link_prefill(
+                self._subgroup_name or "",
+                self._feature_attributes,
+            )
         self._on_start_place_office_point(prefill)
         self.accept()
 

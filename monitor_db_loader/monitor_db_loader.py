@@ -80,6 +80,12 @@ class MonitorDbLoader:
 
     def unload(self):
         menu_path = f"&{PLUGIN_DISPLAY_NAME}"
+        from .core.crm_office_points_map import get_office_points_map_controller
+
+        try:
+            get_office_points_map_controller(self.iface).clear()
+        except Exception:
+            pass
         if self.task_action:
             self.iface.removePluginMenu(menu_path, self.task_action)
             self.iface.removeToolBarIcon(self.task_action)

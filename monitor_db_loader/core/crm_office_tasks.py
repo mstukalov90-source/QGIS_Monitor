@@ -20,9 +20,7 @@ from .crm_task_store import (
 from .crm_tasks_area import analise_lock_holder
 from .db import DatabaseConnection
 
-_LINK_PREFILL_COLUMNS = frozenset(
-    {"oati_id", "earthwork_id", "localwork_id", "avr_mos_id"}
-)
+_LINK_PREFILL_COLUMNS = frozenset(TASK_ID_COLUMNS)
 
 
 def create_office_task(

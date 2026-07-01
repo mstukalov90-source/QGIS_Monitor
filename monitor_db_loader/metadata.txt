@@ -3,7 +3,7 @@ name=Мониторинг разрытий
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Подключение к БД агрегатору данных для мониторинга строек и разрытий. Целевая версия QGIS 3.44 LTR.
-version=1.27.2
+version=1.27.5
 author=StukalovMN
 email=
 

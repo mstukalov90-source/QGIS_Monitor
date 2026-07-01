@@ -33,6 +33,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..core.crm_area_map import TasksAreaMapController
+from ..core.crm_office_points_map import get_office_points_map_controller
 from ..core.config import crm_task_store, crm_tasks
 from ..core.crm_filter_by_area import (
     count_task_result_features,
@@ -160,6 +161,7 @@ class TaskDialog(QDialog):
             district.name if district else result.district_name
         )
         self._area_map = TasksAreaMapController(iface, district_name)
+        self._office_points_map = get_office_points_map_controller(iface)
 
         self.setWindowTitle(f"Задачи — {result.district_name}")
         self.setModal(False)
@@ -841,7 +843,12 @@ class TaskDialog(QDialog):
             return
         from ..core.crm_office_data import append_office_data_to_result
 
-        base = self._office_full_result or self._result
+        if self._is_office_user():
+            if self._office_full_result is None:
+                self._office_full_result = copy_task_result(self._result)
+            base = self._office_full_result
+        else:
+            base = self._result
         append_office_data_to_result(
             base,
             conn,
@@ -849,8 +856,19 @@ class TaskDialog(QDialog):
             self._store_cfg,
             self._metric_srid(),
         )
-        if self._office_full_result is not None:
+        if self._is_office_user():
             self._office_full_result = base
+
+    def _refresh_current_subgroup_view(self) -> None:
+        current = self.tree.currentItem()
+        role = self._role_data(current)
+        subgroup = self._subgroup_from_role(role)
+        self._current_subgroup = subgroup
+        self._current_group_name = self._group_name_from_role(role)
+        self._fill_table(subgroup)
+        if subgroup and subgroup.features and self._selected_row is not None:
+            row = min(self._selected_row, len(subgroup.features) - 1)
+            self._select_row(row)
 
     def _on_office_point_placed(self, lng: float, lat: float) -> None:
         if not self._office_working() or self._place_point_busy:
@@ -891,10 +909,13 @@ class TaskDialog(QDialog):
                 link_prefill=self._pending_link_prefill,
                 store_cfg=self._store_cfg,
             )
+            self._invalidate_office_filter_cache()
             self._reload_office_data_subgroup()
             self._sync_office_display()
             self._populate_tree()
+            self._refresh_current_subgroup_view()
             self._update_status()
+            self._update_office_actions()
             self._refresh_area_map()
             self.status_label.setObjectName("crmSuccess")
             self.status_label.setText("Точка камерального анализа добавлена")
@@ -909,6 +930,19 @@ class TaskDialog(QDialog):
             self._place_point_busy = False
             self._update_office_actions()
 
+    def _refresh_office_points_map(self) -> None:
+        if not self._office_points_map:
+            return
+        conn = self._db_conn
+        if not conn or not self._district or not self._store_cfg:
+            return
+        self._office_points_map.refresh_from_db(
+            conn,
+            self._district,
+            self._store_cfg,
+            self._metric_srid(),
+        )
+
     def _refresh_area_map(self) -> None:
         if not self._area_map:
             return
@@ -921,6 +955,7 @@ class TaskDialog(QDialog):
             office_orders_on_map=self._office_orders_on_map,
             is_office_user=self._is_office_user(),
         )
+        self._refresh_office_points_map()
 
     def _area_status_message(self) -> Optional[str]:
         if not self._is_area():

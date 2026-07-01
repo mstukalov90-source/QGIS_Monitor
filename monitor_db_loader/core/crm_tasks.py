@@ -702,6 +702,23 @@ def run_get_task(
         finally:
             area_progress.close()
 
+        store_cfg = crm_task_store(config)
+        metric_srid = metric_crs.postgisSrid()
+        if metric_srid <= 0:
+            auth = metric_crs.authid() or ""
+            if auth.upper().startswith("EPSG:"):
+                try:
+                    metric_srid = int(auth.split(":", 1)[1])
+                except ValueError:
+                    metric_srid = 32637
+            else:
+                metric_srid = 32637
+        from .crm_office_points_map import refresh_office_points_on_map
+
+        refresh_office_points_on_map(
+            iface, db_conn, district, store_cfg, metric_srid
+        )
+
     from ..ui.task_dialog import TaskDialog
 
     def _restart():
