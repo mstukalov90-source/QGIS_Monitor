@@ -69,6 +69,26 @@ import psycopg2
 
 Требуется доступ к `77.222.63.161` по HTTP (порт 80), как к БД Monitor.
 
+### Публикация новой версии (разработчик)
+
+1. Поднять `version` в `monitor_db_loader/metadata.txt`
+2. Закоммитить и отправить на GitHub и сервер:
+
+   ```bash
+   git push origin main
+   GIT_SSH_COMMAND='ssh -i id_rsa/id_rsa -o IdentitiesOnly=yes' git push server main
+   ```
+
+   После push на сервере автоматически собирается ZIP и обновляется `plugins.xml` (hook `post-receive`).
+
+3. Коллеги в QGIS: **Настройки → Проверить обновления** → **Обновить** у плагина.
+
+Если push идёт только в GitHub:
+
+```bash
+ssh -i id_rsa/id_rsa root@77.222.63.161 'cd /opt/qgis_monitor && git pull origin main && ./scripts/publish_plugin_repo.sh'
+```
+
 ### Вариант B: из ZIP (локально)
 
 1. Соберите архив из корня репозитория:
