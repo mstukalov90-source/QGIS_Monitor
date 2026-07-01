@@ -19,7 +19,7 @@ from .core.config import (
 )
 from .core.db import DatabaseConnection
 from .core.layer_loader import LayerLoader
-from .core.layer_utils import refresh_map_canvas, zoom_map_to_layers
+from .core.layer_utils import ensure_project_crs, refresh_map_canvas, zoom_map_to_layers
 from .core.log_util import log_info
 from .core.crm_tasks import run_get_task
 from .core.photo_primary_analysis import run_primary_analysis
@@ -166,6 +166,7 @@ class MonitorDbLoader:
         if session is None:
             return
 
+        ensure_project_crs(self._config)
         log_info("Запуск первичного анализа фото…")
         db_conn = self._db_connection()
         try:
@@ -187,6 +188,7 @@ class MonitorDbLoader:
         if session is None:
             return
 
+        ensure_project_crs(self._config)
         log_info("Запуск «Получить задачу»…")
         db_conn = self._db_connection()
         run_get_task(
@@ -223,8 +225,9 @@ class MonitorDbLoader:
             self._loaded_layer_ids = result.layer_ids
             self._loaded_group_names = result.group_names
 
+            ensure_project_crs(self._config)
             if result.loaded > 0:
-                zoom_map_to_layers(self.iface, result.layer_ids)
+                zoom_map_to_layers(self.iface, result.layer_ids, self._config)
             else:
                 refresh_map_canvas(self.iface)
 

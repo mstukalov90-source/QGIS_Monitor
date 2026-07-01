@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """Инструмент размещения точки камерального анализа на карте."""
 
-from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+from qgis.core import QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsMapTool
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QCursor
 
-WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+from ..core.layer_utils import STORAGE_CRS
 
 
 class OfficePlacePointMapTool(QgsMapTool):
@@ -26,9 +26,9 @@ class OfficePlacePointMapTool(QgsMapTool):
         canvas = self.canvas()
         dest_crs = canvas.mapSettings().destinationCrs()
         point = map_point
-        if dest_crs.isValid() and WGS84.isValid() and dest_crs != WGS84:
+        if dest_crs.isValid() and STORAGE_CRS.isValid() and dest_crs != STORAGE_CRS:
             transform = QgsCoordinateTransform(
-                dest_crs, WGS84, QgsProject.instance().transformContext()
+                dest_crs, STORAGE_CRS, QgsProject.instance().transformContext()
             )
             point = transform.transform(map_point)
 

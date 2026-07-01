@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """CRS, extent and post-load fixes for vector layers."""
 
-from typing import Iterable
+from typing import Any, Dict, Iterable, Optional
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -12,20 +12,52 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from .config import additional_functionality
 from .log_util import log_info, log_warning
 
-MOSCOW_CRS = QgsCoordinateReferenceSystem("EPSG:4326")
-MOSCOW_EXTENT = QgsRectangle(36.8, 55.1, 38.0, 56.1)
+# СК хранения в PostGIS и memory-слоёв (не менять при смене display_crs).
+STORAGE_CRS = QgsCoordinateReferenceSystem("EPSG:4326")
+MOSCOW_CRS = STORAGE_CRS
+
+DEFAULT_DISPLAY_CRS = "EPSG:3857"
+DISPLAY_CRS = QgsCoordinateReferenceSystem(DEFAULT_DISPLAY_CRS)
+
+MOSCOW_EXTENT_WGS84 = QgsRectangle(36.8, 55.1, 38.0, 56.1)
+MOSCOW_EXTENT = MOSCOW_EXTENT_WGS84
 
 
-def ensure_project_crs() -> QgsCoordinateReferenceSystem:
+def display_crs_from_config(config: Optional[Dict[str, Any]] = None) -> QgsCoordinateReferenceSystem:
+    authid = DEFAULT_DISPLAY_CRS
+    if config is not None:
+        authid = str(
+            additional_functionality(config).get("display_crs") or DEFAULT_DISPLAY_CRS
+        ).strip() or DEFAULT_DISPLAY_CRS
+    crs = QgsCoordinateReferenceSystem(authid)
+    if crs.isValid():
+        return crs
+    log_warning(f"Некорректная display_crs «{authid}», используется {DEFAULT_DISPLAY_CRS}")
+    return QgsCoordinateReferenceSystem(DEFAULT_DISPLAY_CRS)
+
+
+def _extent_for_crs(rect_wgs84: QgsRectangle, dest_crs: QgsCoordinateReferenceSystem) -> QgsRectangle:
+    if not dest_crs.isValid() or dest_crs == STORAGE_CRS:
+        return QgsRectangle(rect_wgs84)
+    return QgsCoordinateTransform(STORAGE_CRS, dest_crs, QgsProject.instance()).transform(
+        rect_wgs84
+    )
+
+
+def ensure_project_crs(config: Optional[Dict[str, Any]] = None) -> QgsCoordinateReferenceSystem:
+    """Установить СК отображения проекта (display_crs); storage остаётся EPSG:4326."""
     project = QgsProject.instance()
-    crs = project.crs()
-    if not crs.isValid():
-        project.setCrs(MOSCOW_CRS)
-        log_info("СК проекта установлена: EPSG:4326")
-        return MOSCOW_CRS
-    return crs
+    target = display_crs_from_config(config)
+    if not target.isValid():
+        target = DISPLAY_CRS
+    current = project.crs()
+    if not current.isValid() or current != target:
+        project.setCrs(target)
+        log_info(f"СК проекта установлена: {target.authid()}")
+    return target
 
 
 def finalize_vector_layer(layer: QgsVectorLayer) -> None:
@@ -69,10 +101,14 @@ def refresh_map_canvas(iface) -> None:
     log_info(f"Холст карты: {len(layers)} видимых слоёв")
 
 
-def zoom_map_to_layers(iface, layer_ids: Iterable[str]) -> None:
+def zoom_map_to_layers(
+    iface,
+    layer_ids: Iterable[str],
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
     """Подогнать карту под охват загруженных слоёв."""
     project = QgsProject.instance()
-    dest_crs = ensure_project_crs()
+    dest_crs = ensure_project_crs(config)
 
     combined = QgsRectangle()
     combined.setNull()
@@ -101,7 +137,7 @@ def zoom_map_to_layers(iface, layer_ids: Iterable[str]) -> None:
 
     if combined.isNull() or combined.isEmpty():
         log_warning("Охват по слоям пуст — используется охват Москвы")
-        combined = QgsRectangle(MOSCOW_EXTENT)
+        combined = _extent_for_crs(MOSCOW_EXTENT_WGS84, dest_crs)
 
     combined.scale(1.1)
     iface.mapCanvas().setExtent(combined)

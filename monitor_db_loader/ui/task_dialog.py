@@ -1621,9 +1621,12 @@ class TaskDialog(QDialog):
 
     def _zoom_to_feature(self, task_feat: TaskFeature) -> None:
         if task_feat.area_geom and not task_feat.area_geom.isEmpty():
+            from qgis.core import QgsCoordinateReferenceSystem
+
             canvas = self._iface.mapCanvas()
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
             rect = self._zoom_extent_for_geometry(
-                task_feat.area_geom, canvas.mapSettings().destinationCrs(), canvas
+                task_feat.area_geom, wgs84, canvas
             )
             if rect is None:
                 return

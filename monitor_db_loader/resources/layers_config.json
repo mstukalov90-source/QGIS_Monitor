@@ -724,6 +724,7 @@
     "auto_refresh": false,
     "password_remember": false,
     "collapse_groups_on_load": true,
+    "display_crs": "EPSG:3857",
     "basemap": {
       "enabled": true,
       "display_name": "OpenStreetMap",
