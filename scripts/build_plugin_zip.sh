@@ -29,4 +29,4 @@ rm -f "${ZIP_PATH}"
 echo "Готово: ${ZIP_PATH}"
 echo "Целевая версия: QGIS 3.44 LTR (также QGIS 4.x)"
 grep -E '^(version|qgisMinimum|qgisMaximum)' "${PLUGIN_DIR}/metadata.txt" || true
-unzip -l "${ZIP_PATH}" | head -22
+unzip -l "${ZIP_PATH}" | head -22 || true
