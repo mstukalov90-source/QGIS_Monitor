@@ -55,10 +55,10 @@ TASK_COLUMN_LABELS = {
     "photo_uuid": "Фото ИИ (uuid)",
     "photo_lens": "Фото Объектив (external_report_id)",
     "ogh_id": "ОГХ (id)",
-    "oati_id": "ОАТИ (order_number)",
-    "earthwork_id": "Земляные работы (registration_number_notifications)",
-    "localwork_id": "Локальные ремонты (global_id)",
-    "avr_mos_id": "АВР (em_call_reg_num)",
+    "oati_id": "ОАТИ (scoped id)",
+    "earthwork_id": "Земляные работы (scoped id)",
+    "localwork_id": "Локальные ремонты (scoped id)",
+    "avr_mos_id": "АВР (scoped id)",
     "sps": "СПС",
     "kgs": "КГС",
     "station_avr": "АВР",
@@ -639,7 +639,13 @@ def task_row_from_feature(
             f"Пропуск объекта «{subgroup_name}»: пустое поле «{source_field}»"
         )
         return None
-    if mapping.get("scoped_geometry_id") and geometry_type:
+    if mapping.get("scoped_geometry_id"):
+        if not geometry_type:
+            log_warning(
+                f"Пропуск объекта «{subgroup_name}»: scoped_geometry_id "
+                f"без типа геометрии слоя"
+            )
+            return None
         business_id = format_scoped_business_id(geometry_type, business_id)
         if business_id is None:
             return None
@@ -1507,7 +1513,14 @@ def _insert_task(
         f'INSERT INTO "{schema}"."{table}" ({col_list}) VALUES ({placeholders}) '
         f"{_task_id_conflict_clause(task_column)}"
     )
-    cur.execute(query, values)
+    try:
+        cur.execute(query, values)
+    except Exception as exc:
+        if psycopg2 is not None and isinstance(
+            exc, psycopg2.errors.UniqueViolation
+        ):
+            return False
+        raise
     return cur.rowcount > 0
 
 
