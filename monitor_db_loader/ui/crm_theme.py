@@ -359,6 +359,15 @@ QDialog#crmDialog QLabel#crmFieldMaterialsBannerMissing {{
     padding: 8px 0;
 }}
 
+QDialog#crmDialog QPlainTextEdit#crmFieldMaterialsComment,
+QDialog#crmDialog QPlainTextEdit#crmOfficeCommentView {{
+    border: 1px solid {COLOR_BORDER_LIGHT};
+    border-radius: 6px;
+    padding: 8px;
+    background: #fafafa;
+    font-size: 13px;
+}}
+
 QDialog#crmDialog QScrollArea#crmPhotoScroll {{
     border: 1px solid {COLOR_BORDER_LIGHT};
     border-radius: 8px;

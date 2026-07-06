@@ -1,0 +1,181 @@
+{
+  "prompt_title": "Перенос функционала комментариев из MONITOR_WEBCRM в плагин MONITOR_QGIS",
+  "target_project": "MONITOR_QGIS",
+  "source_project": "MONITOR_WEBCRM",
+  "created": "2026-07-06",
+  "language": "ru",
+  "summary": "В WebCRM реализованы два независимых сценария с комментариями: (1) необязательный комментарий камерального сотрудника при отправке задачи в поле — сохраняется в crm.tasks_field.office_comment; (2) просмотр комментария полевого сотрудника из mggt_field.reports.comment в окне полевых материалов. Нужно перенести оба сценария в QGIS-плагин с прямой записью/чтением из PostgreSQL (как остальные CRM-операции плагина), без HTTP API.",
+  "architecture_notes": {
+    "shared_database": "WebCRM и QGIS используют одну схему crm в БД monitor на каждом сервере",
+    "qgis_pattern": "Плагин пишет в БД напрямую; эталон логики send_task_snapshot / send_task_to_field — backend/app/crm/store.py (портировано из MONITOR_QGIS crm_task_store.py)",
+    "out_of_scope": "Массовая смена статуса workflow через personnel API в WebCRM — там office_comment остаётся NULL; в QGIS достаточно поддержать комментарий в основном действии «Отправить в поле»"
+  },
+  "features": [
+    {
+      "id": "office_comment_on_send_to_field",
+      "title": "Комментарий камерального анализа при отправке в поле",
+      "user_story": "Офисный сотрудник при отправке активной задачи в поле может оставить необязательный текстовый комментарий для полевого исполнителя.",
+      "database": {
+        "table": "crm.tasks_field",
+        "column": "office_comment",
+        "type": "TEXT",
+        "nullable": true,
+        "migration_file": "sql/15_tasks_field_office_comment.sql",
+        "migration_sql": "ALTER TABLE crm.tasks_field ADD COLUMN IF NOT EXISTS office_comment TEXT;"
+      },
+      "write_behavior": {
+        "trigger_action": "Отправить задачу в поле (active → field snapshot)",
+        "when": "При INSERT строки в crm.tasks_field из crm.tasks",
+        "column_in_insert": "office_comment",
+        "normalization": "trim(); пустая строка → NULL",
+        "optional": true,
+        "only_for_table": "tasks_field",
+        "reference_function": "send_task_snapshot() → send_task_to_field() in backend/app/crm/store.py",
+        "insert_columns_order_hint": [
+          "task_key",
+          "type",
+          "photo_uuid",
+          "photo_lens",
+          "ogh_id",
+          "oati_id",
+          "earthwork_id",
+          "localwork_id",
+          "avr_mos_id",
+          "sps",
+          "kgs",
+          "station_avr",
+          "is_field_data",
+          "is_office_task",
+          "user_created",
+          "user_updated",
+          "office_comment"
+        ]
+      },
+      "read_behavior": {
+        "when": "Просмотр задачи в статусе «В поле» (snapshot tasks_field)",
+        "source": "crm.tasks_field.office_comment WHERE task_key = <uuid>",
+        "also_in_map_attrs": "При загрузке field-задач для карты/списка прокинуть office_comment в атрибуты объекта (аналог snapshot_loader._apply_snapshot_metadata)",
+        "display_if": "значение не NULL и trim() не пустой"
+      },
+      "webcrm_ui_reference": {
+        "screen": "Исполнить задачу (активная задача)",
+        "flow": [
+          "Кнопка «Отправить в поле»",
+          "Диалог подтверждения с текстом «Отправить задачу в поле?»",
+          "Необязательное поле textarea: «Комментарий (необязательно)»",
+          "Подтвердить → INSERT в tasks_field с office_comment"
+        ],
+        "files": [
+          "frontend/src/components/TaskEditModal.tsx",
+          "frontend/src/api/client.ts (sendTaskToField)"
+        ]
+      },
+      "webcrm_api_reference": {
+        "endpoint": "POST /api/tasks/{key}/send-to-field",
+        "request_body": {
+          "office_comment": "string | null"
+        },
+        "schema": "SendToFieldRequest in backend/app/crm/schemas.py"
+      },
+      "qgis_ui_suggestion": {
+        "placement": "В диалоге подтверждения «Отправить в поле» — многострочное QTextEdit или QPlainTextEdit",
+        "label": "Комментарий (необязательно)",
+        "validation": "Нет обязательной валидации",
+        "on_confirm": "Передать trimmed text в INSERT office_comment или NULL"
+      },
+      "qgis_view_suggestion": {
+        "placement": "В форме/панели просмотра задачи «В поле»",
+        "label": "Комментарий камерального анализа:",
+        "widget": "read-only QTextEdit или QLabel с word wrap",
+        "hide_if_empty": true
+      }
+    },
+    {
+      "id": "field_survey_comment_in_materials",
+      "title": "Комментарий полевого сотрудника в окне полевых материалов",
+      "user_story": "При просмотре полевых материалов задачи (фото баннера и галерея) пользователь видит комментарий, оставленный полевым сотрудником в мобильном/полевом приложении.",
+      "database": {
+        "table": "mggt_field.reports",
+        "column": "comment",
+        "type": "TEXT",
+        "nullable": true,
+        "link_to_crm_task": "reports.tasks_key = crm.tasks.key (UUID)",
+        "note": "Колонка уже существует; миграция не требуется"
+      },
+      "read_behavior": {
+        "sql": "SELECT comment FROM mggt_field.reports WHERE tasks_key = %s::uuid AND comment IS NOT NULL AND TRIM(comment) <> '' LIMIT 1",
+        "normalization": "strip(); пустая строка → не показывать",
+        "reference_function": "fetch_field_photos() in backend/app/photos/field_photo.py",
+        "independent_of_photos": true,
+        "note": "Комментарий показывается даже если фото нет; пустое состояние «материалы не найдены» не показывать, если есть комментарий"
+      },
+      "webcrm_ui_reference": {
+        "screen": "Просмотр полевых материалов (FieldMaterialsModal)",
+        "placement": "Между заголовком «Просмотр полевых материалов» и секцией «Фото баннера»",
+        "section_title": "Комментарий полевого сотрудника",
+        "text_style": "white-space: pre-wrap (сохранять переносы строк)",
+        "files": [
+          "frontend/src/components/FieldMaterialsModal.tsx",
+          "frontend/src/App.css (.field-materials-comment)",
+          "backend/app/photos/field_photo.py"
+        ]
+      },
+      "webcrm_api_reference": {
+        "endpoint": "GET /api/tasks/{key}/field-photos",
+        "response_field": "comment",
+        "response_shape": {
+          "photos": [],
+          "banner_missing": false,
+          "comment": "string | null"
+        },
+        "schema": "FieldPhotosResultOut in backend/app/crm/schemas.py"
+      },
+      "qgis_ui_suggestion": {
+        "placement": "В диалоге/панели просмотра полевых материалов — между заголовком и блоком «Фото баннера»",
+        "section_title": "Комментарий полевого сотрудника",
+        "widget": "read-only QTextEdit",
+        "hide_if_empty": true,
+        "preserve_line_breaks": true
+      },
+      "related_photo_query": {
+        "description": "Фото по-прежнему из mggt_field.photos через JOIN reports",
+        "sql_hint": "SELECT p.* FROM mggt_field.reports r JOIN mggt_field.photos p ON p.task = r.task WHERE r.tasks_key = %s::uuid AND p.file_path IS NOT NULL AND TRIM(p.file_path) <> '' ORDER BY p.banner DESC, p.created_at ASC"
+      }
+    }
+  ],
+  "reference_files_in_webcrm": {
+    "backend": [
+      "backend/app/crm/store.py",
+      "backend/app/crm/snapshot_loader.py",
+      "backend/app/crm/schemas.py",
+      "backend/app/routes/tasks.py",
+      "backend/app/photos/field_photo.py"
+    ],
+    "frontend": [
+      "frontend/src/components/TaskEditModal.tsx",
+      "frontend/src/components/FieldMaterialsModal.tsx",
+      "frontend/src/api/client.ts",
+      "frontend/src/types.ts"
+    ],
+    "sql": [
+      "sql/15_tasks_field_office_comment.sql"
+    ]
+  },
+  "implementation_checklist_for_qgis": [
+    "Добавить необязательное поле комментария в UI отправки задачи в поле",
+    "При INSERT в crm.tasks_field записывать office_comment (NULL если пусто)",
+    "При просмотре задачи из tasks_field показывать office_comment как «Комментарий камерального анализа»",
+    "При открытии полевых материалов читать mggt_field.reports.comment по tasks_key",
+    "Показывать блок «Комментарий полевого сотрудника» над фото баннера, скрывать если пусто",
+    "Не ломать существующий INSERT snapshot: audit-поля user_created/user_updated обязательны как в WebCRM"
+  ],
+  "acceptance_criteria": [
+    "Отправка в поле без комментария: office_comment IS NULL в crm.tasks_field",
+    "Отправка в поле с текстом: office_comment сохранён, пробелы по краям обрезаны",
+    "Задача в поле в QGIS показывает комментарий камерального анализа, если он был задан",
+    "Окно полевых материалов показывает comment из mggt_field.reports между заголовком и «Фото баннера»",
+    "Комментарий полевого сотрудника виден даже при отсутствии фото",
+    "Пустые и NULL комментарии не отображаются в UI"
+  ],
+  "prompt_for_ai": "Реализуй в плагине MONITOR_QGIS функционал комментариев по образцу MONITOR_WEBCRM. Два сценария: (1) при «Отправить в поле» — необязательный QTextEdit, значение пишется в crm.tasks_field.office_comment при INSERT snapshot; при просмотре field-задачи показывать read-only «Комментарий камерального анализа». (2) в окне полевых материалов — читать mggt_field.reports.comment по tasks_key, показывать блок «Комментарий полевого сотрудника» между заголовком и секцией фото баннера, с pre-wrap переносами; скрывать если пусто; показывать даже без фото. Используй прямую работу с PostgreSQL как в crm_task_store.py. Эталон: backend/app/crm/store.py (send_task_to_field, send_task_snapshot), backend/app/photos/field_photo.py (fetch_field_photos), frontend TaskEditModal и FieldMaterialsModal. Не трогай HTTP API — только БД и UI плагина."
+}

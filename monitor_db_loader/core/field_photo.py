@@ -67,6 +67,7 @@ class FieldPhotoItem:
 class FieldPhotosResult:
     photos: List[FieldPhotoItem]
     banner_missing: bool
+    comment: Optional[str] = None
 
     @property
     def banner_photo(self) -> Optional[FieldPhotoItem]:
@@ -80,13 +81,39 @@ class FieldPhotosResult:
         return [photo for photo in self.photos if not photo.banner]
 
 
+def _fetch_field_survey_comment(
+    pg,
+    task_key: str,
+) -> Optional[str]:
+    query = """
+        SELECT comment
+        FROM mggt_field.reports
+        WHERE tasks_key = %s::uuid
+          AND comment IS NOT NULL
+          AND TRIM(comment) <> ''
+        LIMIT 1
+    """
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, (task_key,))
+            row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        text = str(row[0]).strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def fetch_field_photos(
     conn: DatabaseConnection,
     task_key: str,
 ) -> FieldPhotosResult:
     pg = _pg_connection(conn)
     if pg is None:
-        return FieldPhotosResult(photos=[], banner_missing=True)
+        return FieldPhotosResult(photos=[], banner_missing=True, comment=None)
+
+    comment = _fetch_field_survey_comment(pg, task_key)
 
     query = """
         SELECT p.id, p.file_path, p.banner, p.created_at, p.photo_key, p.username
@@ -123,7 +150,11 @@ def fetch_field_photos(
         raise
 
     has_banner = any(photo.banner for photo in photos)
-    return FieldPhotosResult(photos=photos, banner_missing=not has_banner)
+    return FieldPhotosResult(
+        photos=photos,
+        banner_missing=not has_banner,
+        comment=comment,
+    )
 
 
 def fetch_field_photo_bytes(

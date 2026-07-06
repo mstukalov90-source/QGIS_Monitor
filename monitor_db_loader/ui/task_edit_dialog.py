@@ -15,6 +15,7 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -32,6 +33,7 @@ from ..core.crm_task_store import (
     STATION_COLUMNS,
     TASK_COLUMN_LABELS,
     TaskRecord,
+    fetch_office_comment,
     send_task_to_done_illegal,
     send_task_to_done_legal,
     send_task_to_field,
@@ -209,6 +211,17 @@ class TaskEditDialog(QDialog):
         )
         style_field_observed_label(self._observed_label, record.field_observed)
         outer.addWidget(self._observed_label)
+
+        self._office_comment_group = QGroupBox("Комментарий камерального анализа")
+        self._office_comment_group.setObjectName("crmFormSection")
+        office_comment_layout = QVBoxLayout(self._office_comment_group)
+        self._office_comment_view = QPlainTextEdit()
+        self._office_comment_view.setReadOnly(True)
+        self._office_comment_view.setObjectName("crmOfficeCommentView")
+        office_comment_layout.addWidget(self._office_comment_view)
+        self._office_comment_group.hide()
+        outer.addWidget(self._office_comment_group)
+        self._setup_office_comment_view()
 
         self._message_label = QLabel("")
         self._message_label.setWordWrap(True)
@@ -400,6 +413,15 @@ class TaskEditDialog(QDialog):
         self._confirm_label = QLabel("")
         self._confirm_label.setWordWrap(True)
         confirm_layout.addWidget(self._confirm_label)
+        self._confirm_comment_label = QLabel("Комментарий (необязательно)")
+        self._confirm_comment_label.setObjectName("crmMuted")
+        self._confirm_comment_label.hide()
+        confirm_layout.addWidget(self._confirm_comment_label)
+        self._confirm_comment_edit = QPlainTextEdit()
+        self._confirm_comment_edit.setPlaceholderText("Комментарий для полевого исполнителя")
+        self._confirm_comment_edit.setMaximumHeight(100)
+        self._confirm_comment_edit.hide()
+        confirm_layout.addWidget(self._confirm_comment_edit)
         confirm_btns = QHBoxLayout()
         confirm_btn = QPushButton("Подтвердить")
         style_button(confirm_btn, "crmBtnPrimary")
@@ -417,6 +439,23 @@ class TaskEditDialog(QDialog):
         outer.addWidget(self._status_group)
 
         self._update_legal_highlights()
+
+    def _resolve_office_comment_text(self) -> Optional[str]:
+        raw = self._feature_attributes.get("_office_comment")
+        if raw is not None:
+            text = str(raw).strip()
+            if text:
+                return text
+        return fetch_office_comment(self._conn, self._store_cfg, self._record.key)
+
+    def _setup_office_comment_view(self) -> None:
+        if self._task_source != "field":
+            return
+        text = self._resolve_office_comment_text()
+        if not text:
+            return
+        self._office_comment_view.setPlainText(text)
+        self._office_comment_group.show()
 
     def _on_view_photo(self) -> None:
         uuid = (self._record.photo_uuid or "").strip()
@@ -561,11 +600,19 @@ class TaskEditDialog(QDialog):
         self._update_legal_highlights()
         self._pending_status = action
         self._confirm_label.setText(STATUS_CONFIRM_MESSAGES[action])
+        show_comment = action == "field"
+        self._confirm_comment_label.setVisible(show_comment)
+        self._confirm_comment_edit.setVisible(show_comment)
+        if show_comment:
+            self._confirm_comment_edit.clear()
         self._confirm_frame.show()
         self._status_buttons_widget.hide()
 
     def _cancel_confirm(self) -> None:
         self._pending_status = None
+        self._confirm_comment_edit.clear()
+        self._confirm_comment_label.hide()
+        self._confirm_comment_edit.hide()
         self._confirm_frame.hide()
         self._status_buttons_widget.show()
 
@@ -573,8 +620,11 @@ class TaskEditDialog(QDialog):
         if not self._pending_status:
             return
         action = self._pending_status
+        office_comment: Optional[str] = None
+        if action == "field":
+            office_comment = self._confirm_comment_edit.toPlainText().strip() or None
         self._cancel_confirm()
-        self._handle_status_action(action)
+        self._handle_status_action(action, office_comment=office_comment)
 
     def _ensure_pick_tool(self) -> Optional[FeaturePickMapTool]:
         if self._iface is None:
@@ -714,7 +764,12 @@ class TaskEditDialog(QDialog):
         self._set_message("Сохранено")
         self._update_legal_highlights()
 
-    def _handle_status_action(self, action: StatusAction) -> None:
+    def _handle_status_action(
+        self,
+        action: StatusAction,
+        *,
+        office_comment: Optional[str] = None,
+    ) -> None:
         if self._is_readonly:
             return
         if action == "illegal":
@@ -733,7 +788,9 @@ class TaskEditDialog(QDialog):
         self._cancel_pick(silent=True)
         updated = self._record_from_form()
         send_fn = {
-            "field": send_task_to_field,
+            "field": lambda c, r, s, l: send_task_to_field(
+                c, r, s, l, office_comment=office_comment
+            ),
             "legal": send_task_to_done_legal,
             "illegal": send_task_to_done_illegal,
             "clear": send_task_to_clear,

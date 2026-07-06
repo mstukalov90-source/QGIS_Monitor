@@ -10,6 +10,7 @@ from qgis.PyQt.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -141,6 +142,25 @@ class FieldMaterialsDialog(QDialog):
 
         return host
 
+    def _build_comment_section(self, comment: str) -> None:
+        section = QWidget()
+        section.setObjectName("crmFieldMaterialsSection")
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel("Комментарий полевого сотрудника")
+        title.setObjectName("crmFieldMaterialsSectionTitle")
+        layout.addWidget(title)
+
+        text_edit = QPlainTextEdit()
+        text_edit.setObjectName("crmFieldMaterialsComment")
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(comment)
+        text_edit.setMaximumHeight(160)
+        layout.addWidget(text_edit)
+
+        self._content_layout.addWidget(section)
+
     def _build_banner_section(self, result: FieldPhotosResult) -> None:
         section = QWidget()
         section.setObjectName("crmFieldMaterialsSection")
@@ -240,12 +260,14 @@ class FieldMaterialsDialog(QDialog):
         try:
             result = fetch_field_photos(self._conn, self._task_key)
             self._result = result
-            if not result.photos:
+            if not result.photos and not result.comment:
                 self._set_error("Материалы не найдены")
                 return
 
             self._status_label.hide()
             self._clear_content()
+            if result.comment:
+                self._build_comment_section(result.comment)
             self._build_banner_section(result)
             self._gallery_photos = result.gallery_photos
             self._gallery_index = 0

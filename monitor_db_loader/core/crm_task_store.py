@@ -226,6 +226,20 @@ def _snapshot_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
     )
 
 
+def _tasks_field_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
+    return (
+        f'ALTER TABLE "{schema}"."{table}" '
+        f"ADD COLUMN IF NOT EXISTS office_comment TEXT",
+    )
+
+
+def _normalize_office_comment(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 SendTaskSnapshotResult = Literal["inserted", "skipped"]
 # Backward-compatible alias
 SendToFieldResult = SendTaskSnapshotResult
@@ -447,12 +461,21 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
 
 
 def _apply_snapshot_migrations(
-    pg, snapshot_schema: str, snapshot_table: str
+    pg,
+    snapshot_schema: str,
+    snapshot_table: str,
+    *,
+    default_table: str = "",
 ) -> None:
     with pg.cursor() as cur:
         _pg_set_admin_timeouts(cur)
         for stmt in _snapshot_migration_statements(snapshot_schema, snapshot_table):
             cur.execute(stmt)
+        if default_table == "tasks_field":
+            for stmt in _tasks_field_migration_statements(
+                snapshot_schema, snapshot_table
+            ):
+                cur.execute(stmt)
     ensure_user_audit_columns(pg, snapshot_schema, snapshot_table)
 
 
@@ -462,6 +485,8 @@ def _create_snapshot_table(
     tasks_table: str,
     snapshot_schema: str,
     snapshot_table: str,
+    *,
+    default_table: str = "",
 ) -> bool:
     global _last_snapshot_ensure_error
     last_error: Optional[str] = None
@@ -479,6 +504,11 @@ def _create_snapshot_table(
                     snapshot_schema, snapshot_table
                 ):
                     cur.execute(stmt)
+                if default_table == "tasks_field":
+                    for stmt in _tasks_field_migration_statements(
+                        snapshot_schema, snapshot_table
+                    ):
+                        cur.execute(stmt)
             pg.commit()
             if not with_fk:
                 log_warning(
@@ -624,7 +654,9 @@ def ensure_task_snapshot_table(
 
     if _table_exists(pg, snapshot_schema, snapshot_table):
         try:
-            _apply_snapshot_migrations(pg, snapshot_schema, snapshot_table)
+            _apply_snapshot_migrations(
+                pg, snapshot_schema, snapshot_table, default_table=default_table
+            )
             pg.commit()
             cache.add(cache_key)
             log_info(f"Таблица {snapshot_schema}.{snapshot_table} проверена/создана")
@@ -638,7 +670,12 @@ def ensure_task_snapshot_table(
             return False
 
     if not _create_snapshot_table(
-        pg, schema, tasks_table, snapshot_schema, snapshot_table
+        pg,
+        schema,
+        tasks_table,
+        snapshot_schema,
+        snapshot_table,
+        default_table=default_table,
     ):
         log_warning(
             f"Не удалось создать {snapshot_schema}.{snapshot_table}: "
@@ -1009,6 +1046,8 @@ def send_task_snapshot(
     config_key: str,
     default_table: str,
     login: str,
+    *,
+    office_comment: Optional[str] = None,
 ) -> SendTaskSnapshotResult:
     """Сохранить снимок задачи в таблицу-снимок (без повторов по task_key)."""
     schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
@@ -1044,6 +1083,9 @@ def send_task_snapshot(
     ]
     audit = make_user_audit(login)
     values += [audit, audit]
+    if config_key == "field_table":
+        columns = list(columns) + ["office_comment"]
+        values.append(_normalize_office_comment(office_comment))
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
     query = (
@@ -1083,10 +1125,50 @@ def send_task_to_field(
     record: TaskRecord,
     store_cfg: Dict[str, Any],
     login: str,
+    *,
+    office_comment: Optional[str] = None,
 ) -> SendTaskSnapshotResult:
     return send_task_snapshot(
-        conn, record, store_cfg, "field_table", "tasks_field", login
+        conn,
+        record,
+        store_cfg,
+        "field_table",
+        "tasks_field",
+        login,
+        office_comment=office_comment,
     )
+
+
+def fetch_office_comment(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    task_key: str,
+) -> Optional[str]:
+    schema, table = _field_table_ref(store_cfg)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return None
+
+    query = (
+        f'SELECT office_comment FROM "{schema}"."{table}" '
+        f"WHERE task_key = %s "
+        f"AND office_comment IS NOT NULL AND TRIM(office_comment) <> '' "
+        f"LIMIT 1"
+    )
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, (task_key,))
+            row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return _normalize_office_comment(str(row[0]))
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(
+            f"Не удалось загрузить office_comment (key={task_key}): {exc}"
+        )
+        return None
 
 
 def send_task_to_done_legal(

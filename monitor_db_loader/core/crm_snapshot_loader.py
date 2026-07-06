@@ -43,6 +43,7 @@ class SnapshotRow:
     record: TaskRecord
     subgroup_name: str
     group_name: str
+    office_comment: Optional[str] = None
 
 
 def _find_subgroup_for_record(
@@ -80,6 +81,9 @@ def fetch_snapshot_rows(
         "kgs",
         "station_avr",
     ]
+    include_office_comment = config_key == "field_table"
+    if include_office_comment:
+        columns.append("office_comment")
     col_list = ", ".join(f'"{c}"' for c in columns)
     query = f'SELECT {col_list} FROM "{schema}"."{table}" ORDER BY sent_at DESC'
 
@@ -109,6 +113,10 @@ def fetch_snapshot_rows(
                     if len(row) > 13
                     else None,
                 )
+                office_comment = None
+                if include_office_comment and len(row) > 14 and row[14] is not None:
+                    text = str(row[14]).strip()
+                    office_comment = text or None
                 resolved = _find_subgroup_for_record(record, store_cfg)
                 if resolved is None:
                     continue
@@ -127,6 +135,7 @@ def fetch_snapshot_rows(
                         record=record,
                         subgroup_name=subgroup_name,
                         group_name=group_name,
+                        office_comment=office_comment,
                     )
                 )
     except Exception as exc:
@@ -204,6 +213,8 @@ def lookup_feature_in_index(
     attrs["_snapshot_key"] = snap.snapshot_key
     if snap.sent_at:
         attrs["_sent_at"] = snap.sent_at
+    if snap.office_comment:
+        attrs["_office_comment"] = snap.office_comment
     return TaskFeature(
         layer=base.layer,
         layer_name=base.layer_name,
@@ -259,6 +270,8 @@ def lookup_feature_in_project(
             attrs["_snapshot_key"] = snap.snapshot_key
             if snap.sent_at:
                 attrs["_sent_at"] = snap.sent_at
+            if snap.office_comment:
+                attrs["_office_comment"] = snap.office_comment
             return TaskFeature(
                 layer=layer,
                 layer_name=layer.name(),
