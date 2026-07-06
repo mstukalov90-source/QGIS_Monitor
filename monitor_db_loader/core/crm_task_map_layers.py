@@ -20,9 +20,12 @@ from qgis.PyQt.QtWidgets import QApplication, QProgressDialog
 from .config import crm_task_store
 from .crm_snapshot_loader import collect_snapshot_tasks
 from .crm_task_store import (
+    TASK_ID_COLUMNS,
     enrich_task_result_field_observed,
     ensure_crm_session_cache,
     filter_sent_tasks_from_result,
+    layer_geometry_type,
+    task_row_from_feature,
 )
 from .crm_tasks import TaskFeature, TaskResult, copy_task_result
 from .crm_tasks_area import collect_tasks_area
@@ -161,15 +164,22 @@ def _business_id(
     subgroup_name: str,
     attributes: Dict[str, Any],
     store_cfg: Dict[str, Any],
+    layer: Any = None,
 ) -> str:
-    mapping = store_cfg.get("subgroups", {}).get(subgroup_name, {})
-    source_field = mapping.get("source_field")
-    if not source_field:
+    row = task_row_from_feature(
+        "",
+        subgroup_name,
+        attributes,
+        store_cfg,
+        geometry_type=layer_geometry_type(layer),
+    )
+    if row is None:
         return ""
-    value = attributes.get(source_field)
-    if value is None:
-        return ""
-    return str(value).strip()
+    for col in TASK_ID_COLUMNS:
+        value = row.get(col)
+        if value:
+            return str(value)
+    return ""
 
 
 def _build_fields() -> QgsFields:
@@ -205,7 +215,7 @@ def _make_feature(
             group_name,
             subgroup_name,
             format_field_observed(attrs.get("field_observed")),
-            _business_id(subgroup_name, attrs, store_cfg),
+            _business_id(subgroup_name, attrs, store_cfg, task_feat.layer),
             str(task_feat.sent_at or attrs.get("_sent_at") or ""),
         ]
     )

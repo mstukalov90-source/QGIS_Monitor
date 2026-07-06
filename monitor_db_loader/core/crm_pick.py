@@ -2,7 +2,7 @@
 """Разрешение слоёв для выбора ID с карты в crm.tasks."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from qgis.core import QgsProject, QgsVectorLayer
 
@@ -53,10 +53,38 @@ def _find_subgroup_cfg(
     return None
 
 
+def _lookup_field_for_links(mapping: Dict[str, Any]) -> Optional[str]:
+    return mapping.get("link_lookup_field") or mapping.get("source_field")
+
+
+def _layers_for_link_search(
+    root,
+    subgroup_name: str,
+    sub_cfg: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> Tuple[List[QgsVectorLayer], List[str]]:
+    if mapping.get("link_lookup_field"):
+        prefix = f"{subgroup_name} —"
+        layers = [
+            layer
+            for layer in QgsProject.instance().mapLayers().values()
+            if isinstance(layer, QgsVectorLayer)
+            and layer.name().startswith(prefix)
+        ]
+        return layers, []
+    return resolve_layers(
+        root,
+        sub_cfg.get("layers", []),
+        sub_cfg.get("groups", []),
+    )
+
+
 def resolve_pick_target(
     config: Dict[str, Any],
     task_column: str,
     root=None,
+    *,
+    for_link_pick: bool = False,
 ) -> Optional[PickTarget]:
     """Вернуть слои и source_field для выбора значения task_column с карты."""
     store_cfg = crm_task_store(config)
@@ -65,7 +93,10 @@ def resolve_pick_target(
         return None
 
     mapping = store_cfg.get("subgroups", {}).get(subgroup_name, {})
-    source_field = mapping.get("source_field")
+    if for_link_pick:
+        source_field = _lookup_field_for_links(mapping)
+    else:
+        source_field = mapping.get("source_field")
     if not source_field:
         return None
 
@@ -80,9 +111,14 @@ def resolve_pick_target(
     if root is None:
         root = QgsProject.instance().layerTreeRoot()
 
-    layer_names = sub_cfg.get("layers", [])
-    group_names = sub_cfg.get("groups", [])
-    layers, missing = resolve_layers(root, layer_names, group_names)
+    if for_link_pick and mapping.get("link_lookup_field"):
+        layers, missing = _layers_for_link_search(
+            root, subgroup_name, sub_cfg, mapping
+        )
+    else:
+        layer_names = sub_cfg.get("layers", [])
+        group_names = sub_cfg.get("groups", [])
+        layers, missing = resolve_layers(root, layer_names, group_names)
 
     return PickTarget(
         subgroup_name=subgroup_name,
@@ -109,7 +145,9 @@ def resolve_link_pick_bundle(
     seen_layer_ids: set = set()
 
     for task_column in link_columns:
-        target = resolve_pick_target(config, task_column, root=root)
+        target = resolve_pick_target(
+            config, task_column, root=root, for_link_pick=True
+        )
         if target is None:
             continue
         if target.subgroup_name not in subgroup_names:

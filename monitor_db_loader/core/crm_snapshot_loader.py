@@ -16,6 +16,9 @@ from .crm_task_store import (
     _pg_recover_transaction,
     _pg_rollback,
     _snapshot_table_ref,
+    format_scoped_business_id,
+    layer_geometry_type,
+    parse_scoped_business_id,
 )
 from .crm_tasks import (
     TaskFeature,
@@ -179,8 +182,16 @@ def build_district_feature_index(
         for layer in layers:
             if layer.fields().indexOf(source_field) < 0:
                 continue
+            geometry_type = layer_geometry_type(layer)
+            scoped = bool(mapping.get("scoped_geometry_id"))
             for feat in features_in_district(layer, district, metric_crs):
-                business_id = _normalize_id_value(feat[source_field])
+                raw_id = _normalize_id_value(feat[source_field])
+                if not raw_id:
+                    continue
+                if scoped and geometry_type:
+                    business_id = format_scoped_business_id(geometry_type, raw_id)
+                else:
+                    business_id = raw_id
                 if not business_id:
                     continue
                 lookup_key = (subgroup_name, business_id)
@@ -255,14 +266,19 @@ def lookup_feature_in_project(
     )
 
     business_text = str(business_id).strip()
+    scoped = bool(mapping.get("scoped_geometry_id"))
+    prefix, raw_business_id = parse_scoped_business_id(business_text)
 
     for layer in layers:
+        if scoped and prefix and layer_geometry_type(layer) != prefix:
+            continue
         field_idx = layer.fields().indexOf(source_field)
         if field_idx < 0:
             continue
+        lookup_id = raw_business_id if scoped else business_text
         for feat in features_in_district(layer, district, metric_crs):
             val = _normalize_id_value(feat[source_field])
-            if val != business_text:
+            if val != lookup_id:
                 continue
 
             attrs = {f.name(): feat[f.name()] for f in feat.fields()}

@@ -1313,6 +1313,7 @@ class TaskDialog(QDialog):
                 self._current_subgroup.name,
                 self._selected_task_feat.attributes,
                 self._store_cfg,
+                layer=self._selected_task_feat.layer,
             )
         if record is None:
             QMessageBox.warning(

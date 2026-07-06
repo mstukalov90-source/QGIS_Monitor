@@ -25,7 +25,12 @@ from .auth import (
     filter_rayons_on_layer,
 )
 from .config import crm_task_store, crm_tasks, database_connection
-from .crm_task_store import ensure_all_snapshot_tables, persist_task_result
+from .crm_task_store import (
+    ensure_all_snapshot_tables,
+    layer_geometry_type,
+    persist_task_result,
+    resolve_task_lookup,
+)
 from .db import DatabaseConnection
 from .district_utils import (
     DistrictBoundary,
@@ -269,6 +274,65 @@ def _collect_subgroup_features(
     return collected
 
 
+_GEOMETRY_LAYER_PRIORITY = {"point": 0, "line": 1, "polygon": 2}
+
+
+def _layer_geometry_priority(layer: Optional[QgsVectorLayer]) -> int:
+    gtype = layer_geometry_type(layer)
+    if gtype is None:
+        return 99
+    return _GEOMETRY_LAYER_PRIORITY.get(gtype, 99)
+
+
+def dedupe_subgroup_features(
+    features: List[TaskFeature],
+    subgroup_name: str,
+    store_cfg: Dict[str, Any],
+) -> List[TaskFeature]:
+    """Одна feature на business_id; для scoped_geometry_id — отдельная строка на геометрию."""
+    best_by_business: Dict[Tuple[str, str], TaskFeature] = {}
+    best_by_task_key: Dict[str, TaskFeature] = {}
+    unkeyed: List[TaskFeature] = []
+
+    mapping = store_cfg.get("subgroups", {}).get(subgroup_name, {})
+    scoped = bool(mapping.get("scoped_geometry_id"))
+
+    for feat in features:
+        lookup = resolve_task_lookup(
+            subgroup_name,
+            feat.attributes,
+            store_cfg,
+            layer=feat.layer,
+        )
+        if lookup:
+            if scoped:
+                if lookup not in best_by_business:
+                    best_by_business[lookup] = feat
+                continue
+            existing = best_by_business.get(lookup)
+            if existing is None:
+                best_by_business[lookup] = feat
+                continue
+            if _layer_geometry_priority(feat.layer) < _layer_geometry_priority(
+                existing.layer
+            ):
+                best_by_business[lookup] = feat
+            continue
+
+        task_key = feat.task_key
+        if task_key:
+            if task_key not in best_by_task_key:
+                best_by_task_key[task_key] = feat
+            continue
+        unkeyed.append(feat)
+
+    return (
+        list(best_by_business.values())
+        + list(best_by_task_key.values())
+        + unkeyed
+    )
+
+
 def _build_task_result(
     cfg: Dict[str, Any],
     district: DistrictBoundary,
@@ -278,6 +342,7 @@ def _build_task_result(
     date_to: QDate,
     apply_date_filter: bool,
     progress: QProgressDialog,
+    store_cfg: Dict[str, Any],
 ) -> tuple:
     result = TaskResult(
         district_name=district.name,
@@ -331,6 +396,7 @@ def _build_task_result(
                 result.errors.append(msg)
 
             date_field = sub_cfg.get("date_field") if apply_date_filter else None
+            sub_name = sub_cfg.get("name", "")
             features = _collect_subgroup_features(
                 layers,
                 district,
@@ -338,17 +404,18 @@ def _build_task_result(
                 date_field,
                 date_from,
                 date_to,
-                sub_cfg.get("name", ""),
+                sub_name,
             )
+            features = dedupe_subgroup_features(features, sub_name, store_cfg)
             group.subgroups.append(
                 TaskSubgroup(
-                    name=sub_cfg.get("name", ""),
+                    name=sub_name,
                     features=features,
                     date_field=date_field,
                 )
             )
             log_info(
-                f"CRM подгруппа «{sub_cfg.get('name', '')}»: {len(features)} объектов"
+                f"CRM подгруппа «{sub_name}»: {len(features)} объектов"
             )
 
         result.groups.append(group)
@@ -620,6 +687,7 @@ def run_get_task(
             date_to,
             apply_date_filter,
             progress,
+            crm_task_store(config),
         )
         progress.close()
 

@@ -592,6 +592,22 @@
       "boundaries_layer": "Границы районов",
       "field": "rayon"
     },
+    "order_tracks": {
+      "schema": "mggt_field",
+      "table": "tracks",
+      "id_column": "id",
+      "geometry_column": "geom",
+      "task_column": "task",
+      "display_columns": [
+        "name",
+        "username",
+        "started_at",
+        "duration_sec",
+        "comment",
+        "area_key",
+        "created_at"
+      ]
+    },
     "groups": [
       {
         "name": "Разрытия",
@@ -628,8 +644,10 @@
           },
           {
             "name": "Уведомления на земляные работы",
-            "groups": [
-              "Данные о действующих зарегистрированных уведомлениях на проведение земляных работ"
+            "layers": [
+              "Уведомления на земляные работы — точки",
+              "Уведомления на земляные работы — линии",
+              "Уведомления на земляные работы — полигоны"
             ],
             "date_field": "work_start_date"
           },
@@ -680,15 +698,21 @@
         },
         "Уведомления на земляные работы": {
           "task_column": "earthwork_id",
-          "source_field": "registration_number_notifications"
+          "source_field": "id",
+          "link_lookup_field": "registration_number_notifications",
+          "scoped_geometry_id": true
         },
         "Текущие локальные ремонты": {
           "task_column": "localwork_id",
-          "source_field": "global_id"
+          "source_field": "id",
+          "link_lookup_field": "global_id",
+          "scoped_geometry_id": true
         },
         "Аварийно-восстановительные работы": {
           "task_column": "avr_mos_id",
-          "source_field": "em_call_reg_num"
+          "source_field": "id",
+          "link_lookup_field": "em_call_reg_num",
+          "scoped_geometry_id": true
         },
         "Полевые данные": {
           "source": "field_data",

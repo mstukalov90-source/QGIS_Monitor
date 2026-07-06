@@ -142,17 +142,25 @@ _DDL_STATEMENTS = (
     """,
 )
 
-_DROP_TASK_ID_UNIQUE_INDEXES = (
-    "DROP INDEX IF EXISTS crm.tasks_uq_photo_uuid",
-    "DROP INDEX IF EXISTS crm.tasks_uq_photo_lens",
-    "DROP INDEX IF EXISTS crm.tasks_uq_ogh_id",
-    "DROP INDEX IF EXISTS crm.tasks_uq_oati_id",
-    "DROP INDEX IF EXISTS crm.tasks_uq_earthwork_id",
-    "DROP INDEX IF EXISTS crm.tasks_uq_localwork_id",
-    "DROP INDEX IF EXISTS crm.tasks_uq_avr_mos_id",
+_CREATE_TASK_ID_UNIQUE_INDEXES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_photo_uuid "
+    "ON crm.tasks (photo_uuid) WHERE photo_uuid IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_photo_lens "
+    "ON crm.tasks (photo_lens) WHERE photo_lens IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_ogh_id "
+    "ON crm.tasks (ogh_id) WHERE ogh_id IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_oati_id "
+    "ON crm.tasks (oati_id) WHERE oati_id IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_earthwork_id "
+    "ON crm.tasks (earthwork_id) WHERE earthwork_id IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_localwork_id "
+    "ON crm.tasks (localwork_id) WHERE localwork_id IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_uq_avr_mos_id "
+    "ON crm.tasks (avr_mos_id) WHERE avr_mos_id IS NOT NULL",
 )
 
-_TASKS_INDEXES_DROPPED_KEY = "crm.tasks.indexes_dropped"
+
+_tasks_unique_indexes_ready: Set[str] = set()
 
 
 def _pg_set_admin_timeouts(cur) -> None:
@@ -388,6 +396,28 @@ _TASKS_LOOKUP_INDEXES = tuple(
 _tasks_lookup_indexes_ready: Set[str] = set()
 
 
+def ensure_tasks_unique_indexes(conn: DatabaseConnection) -> bool:
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+    key = "crm.tasks.unique_indexes"
+    if key in _tasks_unique_indexes_ready:
+        return True
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            _pg_set_admin_timeouts(cur)
+            for stmt in _CREATE_TASK_ID_UNIQUE_INDEXES:
+                cur.execute(stmt)
+        pg.commit()
+        _tasks_unique_indexes_ready.add(key)
+        return True
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось создать unique-индексы crm.tasks: {exc}")
+        return False
+
+
 def ensure_tasks_lookup_indexes(conn: DatabaseConnection) -> bool:
     pg = _pg_connection(conn)
     if pg is None:
@@ -431,11 +461,11 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
                 pg.commit()
             except Exception:
                 _pg_rollback(pg)
+            ensure_tasks_unique_indexes(conn)
             return True
         cache.discard(cache_key)
 
     _pg_recover_transaction(pg)
-    indexes_dropped_key = _TASKS_INDEXES_DROPPED_KEY
     try:
         with pg.cursor() as cur:
             _pg_set_admin_timeouts(cur)
@@ -444,12 +474,9 @@ def ensure_tasks_table(conn: DatabaseConnection) -> bool:
             for stmt in _station_migration_statements(schema, table):
                 cur.execute(stmt)
             ensure_user_audit_columns(pg, schema, table)
-            if indexes_dropped_key not in cache:
-                for stmt in _DROP_TASK_ID_UNIQUE_INDEXES:
-                    cur.execute(stmt)
-                cache.add(indexes_dropped_key)
         pg.commit()
         cache.add(cache_key)
+        ensure_tasks_unique_indexes(conn)
         ensure_tasks_lookup_indexes(conn)
         log_info("Таблица crm.tasks проверена/создана")
         return True
@@ -538,11 +565,58 @@ def _normalize_id_value(value: Any) -> Optional[str]:
     return text or None
 
 
+_SCOPED_GEOMETRY_PREFIXES = frozenset({"point", "line", "polygon"})
+
+
+def format_scoped_business_id(geometry_type: str, raw_id: Any) -> Optional[str]:
+    normalized = _normalize_id_value(raw_id)
+    if normalized is None:
+        return None
+    if ":" in normalized:
+        prefix = normalized.split(":", 1)[0]
+        if prefix in _SCOPED_GEOMETRY_PREFIXES:
+            return normalized
+    return f"{geometry_type}:{normalized}"
+
+
+def parse_scoped_business_id(business_id: str) -> Tuple[Optional[str], str]:
+    if ":" in business_id:
+        prefix, raw = business_id.split(":", 1)
+        if prefix in _SCOPED_GEOMETRY_PREFIXES:
+            return prefix, raw
+    return None, business_id
+
+
+def _task_id_conflict_clause(task_column: str) -> str:
+    return (
+        f'ON CONFLICT ("{task_column}") '
+        f'WHERE "{task_column}" IS NOT NULL DO NOTHING'
+    )
+
+
+def layer_geometry_type(layer: Any) -> Optional[str]:
+    """point | line | polygon из QgsVectorLayer."""
+    if layer is None:
+        return None
+    from qgis.core import QgsWkbTypes
+
+    gtype = layer.geometryType()
+    if gtype == QgsWkbTypes.PointGeometry:
+        return "point"
+    if gtype == QgsWkbTypes.LineGeometry:
+        return "line"
+    if gtype == QgsWkbTypes.PolygonGeometry:
+        return "polygon"
+    return None
+
+
 def task_row_from_feature(
     group_name: str,
     subgroup_name: str,
     attributes: Dict[str, Any],
     store_cfg: Dict[str, Any],
+    *,
+    geometry_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     subgroups_cfg = store_cfg.get("subgroups", {})
     mapping = subgroups_cfg.get(subgroup_name)
@@ -565,6 +639,10 @@ def task_row_from_feature(
             f"Пропуск объекта «{subgroup_name}»: пустое поле «{source_field}»"
         )
         return None
+    if mapping.get("scoped_geometry_id") and geometry_type:
+        business_id = format_scoped_business_id(geometry_type, business_id)
+        if business_id is None:
+            return None
 
     row = {
         "type": group_name,
@@ -584,9 +662,20 @@ def resolve_task_lookup(
     subgroup_name: str,
     attributes: Dict[str, Any],
     store_cfg: Dict[str, Any],
+    *,
+    geometry_type: Optional[str] = None,
+    layer: Any = None,
 ) -> Optional[Tuple[str, str]]:
     """Вернуть (task_column, business_id) для поиска строки в crm.tasks."""
-    row = task_row_from_feature("", subgroup_name, attributes, store_cfg)
+    if geometry_type is None and layer is not None:
+        geometry_type = layer_geometry_type(layer)
+    row = task_row_from_feature(
+        "",
+        subgroup_name,
+        attributes,
+        store_cfg,
+        geometry_type=geometry_type,
+    )
     if row is None:
         return None
     task_column = next(col for col in TASK_ID_COLUMNS if row[col] is not None)
@@ -993,7 +1082,10 @@ def enrich_task_result_field_observed(
                 key = feat.task_key
                 if not key:
                     lookup = resolve_task_lookup(
-                        subgroup.name, feat.attributes, store_cfg
+                        subgroup.name,
+                        feat.attributes,
+                        store_cfg,
+                        layer=feat.layer,
                     )
                     if lookup:
                         key = task_index.get(lookup)
@@ -1024,7 +1116,10 @@ def filter_sent_tasks_from_result(
             kept = []
             for feat in subgroup.features:
                 lookup = resolve_task_lookup(
-                    subgroup.name, feat.attributes, store_cfg
+                    subgroup.name,
+                    feat.attributes,
+                    store_cfg,
+                    layer=feat.layer,
                 )
                 if lookup:
                     task_key = task_index.get(lookup)
@@ -1266,8 +1361,12 @@ def fetch_task_for_feature(
     subgroup_name: str,
     attributes: Dict[str, Any],
     store_cfg: Dict[str, Any],
+    *,
+    layer: Any = None,
 ) -> Optional[TaskRecord]:
-    lookup = resolve_task_lookup(subgroup_name, attributes, store_cfg)
+    lookup = resolve_task_lookup(
+        subgroup_name, attributes, store_cfg, layer=layer
+    )
     if lookup is None:
         return None
     task_column, business_id = lookup
@@ -1397,14 +1496,19 @@ def _task_exists(cur, schema: str, table: str, column: str, value: str) -> bool:
 
 def _insert_task(
     cur, schema: str, table: str, row: Dict[str, Any], login: str
-) -> None:
+) -> bool:
+    task_column = next(col for col in TASK_ID_COLUMNS if row[col] is not None)
     audit = make_user_audit(login)
     columns = ["type"] + list(TASK_ID_COLUMNS) + list(USER_AUDIT_COLUMNS)
     values = [row["type"]] + [row[col] for col in TASK_ID_COLUMNS] + [audit, audit]
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
-    query = f'INSERT INTO "{schema}"."{table}" ({col_list}) VALUES ({placeholders})'
+    query = (
+        f'INSERT INTO "{schema}"."{table}" ({col_list}) VALUES ({placeholders}) '
+        f"{_task_id_conflict_clause(task_column)}"
+    )
     cur.execute(query, values)
+    return cur.rowcount > 0
 
 
 def persist_task_result(
@@ -1429,38 +1533,41 @@ def persist_task_result(
 
     _pg_recover_transaction(pg)
     try:
-        to_insert: List[Dict[str, Any]] = []
         cache = ensure_crm_session_cache(conn, store_cfg)
         task_index = cache.task_index
-
-        for group in task_result.groups:
-            for subgroup in group.subgroups:
-                for task_feat in subgroup.features:
-                    row = task_row_from_feature(
-                        group.name,
-                        subgroup.name,
-                        task_feat.attributes,
-                        store_cfg,
-                    )
-                    if row is None:
-                        stats.invalid += 1
-                        continue
-
-                    task_column = next(
-                        col for col in TASK_ID_COLUMNS if row[col] is not None
-                    )
-                    business_id = row[task_column]
-
-                    if (task_column, business_id) in task_index:
-                        stats.skipped += 1
-                        continue
-
-                    to_insert.append(row)
+        seen: Set[Tuple[str, str]] = set()
 
         with pg.cursor() as cur:
-            for row in to_insert:
-                _insert_task(cur, schema, table, row, login)
-                stats.inserted += 1
+            for group in task_result.groups:
+                for subgroup in group.subgroups:
+                    for task_feat in subgroup.features:
+                        row = task_row_from_feature(
+                            group.name,
+                            subgroup.name,
+                            task_feat.attributes,
+                            store_cfg,
+                            geometry_type=layer_geometry_type(task_feat.layer),
+                        )
+                        if row is None:
+                            stats.invalid += 1
+                            continue
+
+                        task_column = next(
+                            col for col in TASK_ID_COLUMNS if row[col] is not None
+                        )
+                        business_id = row[task_column]
+                        lookup = (task_column, business_id)
+
+                        if lookup in seen or lookup in task_index:
+                            stats.skipped += 1
+                            continue
+                        seen.add(lookup)
+
+                        if _insert_task(cur, schema, table, row, login):
+                            stats.inserted += 1
+                            task_index[lookup] = ""
+                        else:
+                            stats.skipped += 1
 
         pg.commit()
         if stats.inserted:
