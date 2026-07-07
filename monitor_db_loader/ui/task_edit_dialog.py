@@ -2,7 +2,7 @@
 """Диалог редактирования строки crm.tasks."""
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
@@ -132,6 +132,9 @@ def _get_legal_validation(
     return LegalValidation(is_valid=True, has_link=True, has_station=True)
 
 
+TASK_NOT_IN_DISTRICT = "Задача не в выбранном районе"
+
+
 class TaskEditDialog(QDialog):
     def __init__(
         self,
@@ -149,12 +152,16 @@ class TaskEditDialog(QDialog):
         feature_attributes: Optional[Dict[str, Any]] = None,
         office_working: bool = False,
         on_start_place_office_point: Optional[Callable[[Optional[Dict[str, str]]], None]] = None,
+        district_name: str = "",
+        active_task_keys: Optional[Set[str]] = None,
     ):
         super().__init__(parent)
         self._record = record
         self._conn = conn
         self._store_cfg = store_cfg
         self._user_login = user_login or ""
+        self._district_name = (district_name or "").strip()
+        self._active_task_keys = set(active_task_keys or [])
         self._iface = iface
         self._config = config
         self._subgroup_name = subgroup_name
@@ -498,7 +505,14 @@ class TaskEditDialog(QDialog):
         self.accept()
 
     def _configure_status_visibility(self) -> None:
-        can_field = self._task_source == "active"
+        in_active_session = (
+            not self._active_task_keys or self._record.key in self._active_task_keys
+        )
+        can_field = (
+            self._task_source == "active"
+            and bool(self._district_name)
+            and in_active_session
+        )
         can_legal = self._task_source in ("active", "field")
         can_illegal = (
             self._task_source in ("active", "field")
@@ -787,9 +801,22 @@ class TaskEditDialog(QDialog):
 
         self._cancel_pick(silent=True)
         updated = self._record_from_form()
+        if action == "field":
+            if not self._district_name:
+                self._set_message("Не выбран район сессии", error=True)
+                return
+            if self._active_task_keys and updated.key not in self._active_task_keys:
+                self._set_message(TASK_NOT_IN_DISTRICT, error=True)
+                return
+        district_name = self._district_name
         send_fn = {
             "field": lambda c, r, s, l: send_task_to_field(
-                c, r, s, l, office_comment=office_comment
+                c,
+                r,
+                s,
+                l,
+                office_comment=office_comment,
+                rayon=district_name,
             ),
             "legal": send_task_to_done_legal,
             "illegal": send_task_to_done_illegal,
@@ -852,6 +879,8 @@ class TaskEditDialog(QDialog):
         feature_attributes: Optional[Dict[str, Any]] = None,
         office_working: bool = False,
         on_start_place_office_point: Optional[Callable[[Optional[Dict[str, str]]], None]] = None,
+        district_name: str = "",
+        active_task_keys: Optional[Set[str]] = None,
     ) -> "TaskEditDialog":
         win_parent = parent or (iface.mainWindow() if iface else None)
         dlg = TaskEditDialog(
@@ -868,6 +897,8 @@ class TaskEditDialog(QDialog):
             feature_attributes=feature_attributes,
             office_working=office_working,
             on_start_place_office_point=on_start_place_office_point,
+            district_name=district_name,
+            active_task_keys=active_task_keys,
         )
         if on_finished is not None:
             dlg.finished.connect(on_finished)

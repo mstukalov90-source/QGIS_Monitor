@@ -238,6 +238,8 @@ def _tasks_field_migration_statements(schema: str, table: str) -> Tuple[str, ...
     return (
         f'ALTER TABLE "{schema}"."{table}" '
         f"ADD COLUMN IF NOT EXISTS office_comment TEXT",
+        f'ALTER TABLE "{schema}"."{table}" '
+        f"ADD COLUMN IF NOT EXISTS rayon TEXT",
     )
 
 
@@ -585,6 +587,98 @@ def parse_scoped_business_id(business_id: str) -> Tuple[Optional[str], str]:
         if prefix in _SCOPED_GEOMETRY_PREFIXES:
             return prefix, raw
     return None, business_id
+
+
+def _geom_hash_expr(geom_col: str = "geom") -> str:
+    return f"md5(ST_AsEWKB(ST_SetSRID(ST_MakeValid({geom_col}), 4326)))"
+
+
+def find_task_by_source_anchor(
+    conn: DatabaseConnection,
+    global_id: Any,
+    geom_hash: str,
+    task_column: str,
+) -> Optional[str]:
+    if global_id is None or not geom_hash or task_column not in TASK_ID_COLUMNS:
+        return None
+    pg = _pg_connection(conn)
+    if pg is None:
+        return None
+    query = f"""
+        SELECT key::text
+        FROM crm.tasks
+        WHERE source_global_id = %s
+          AND source_geom_hash = %s
+          AND "{task_column}" IS NOT NULL
+        LIMIT 1
+    """
+    with pg.cursor() as cur:
+        cur.execute(query, (global_id, geom_hash))
+        row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def link_items_task_key(
+    conn: DatabaseConnection,
+    task_key: str,
+    qualified_table: str,
+    row_id: Any,
+    *,
+    geom_col: str = "geom",
+    global_id: Any = None,
+    task_column: Optional[str] = None,
+    geometry_type: Optional[str] = None,
+) -> bool:
+    """Write task_key on items row and source anchor on crm.tasks."""
+    if row_id is None:
+        return False
+    pg = _pg_connection(conn)
+    if pg is None:
+        return False
+    with pg.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {qualified_table}
+            SET task_key = %s::uuid
+            WHERE id = %s
+              AND (task_key IS NULL OR task_key = %s::uuid)
+            """,
+            (task_key, row_id, task_key),
+        )
+        if cur.rowcount == 0:
+            return False
+        anchor_sets = ["source_table = %s", "source_row_id = %s"]
+        anchor_params: List[Any] = [qualified_table, row_id]
+        if global_id is not None:
+            anchor_sets.append("source_global_id = %s")
+            anchor_params.append(global_id)
+        anchor_sets.append(
+            f"source_geom_hash = {_geom_hash_expr(f't.\"{geom_col}\"')}"
+        )
+        anchor_params.extend([task_key, row_id])
+        cur.execute(
+            f"""
+            UPDATE crm.tasks ct
+            SET {", ".join(anchor_sets)}
+            FROM {qualified_table} t
+            WHERE ct.key = %s::uuid AND t.id = %s
+            """,
+            anchor_params,
+        )
+        if task_column and geometry_type:
+            business_id = format_scoped_business_id(geometry_type, row_id)
+            if business_id:
+                cur.execute(
+                    f"""
+                    UPDATE crm.tasks
+                    SET "{task_column}" = %s
+                    WHERE key = %s::uuid
+                      AND ("{task_column}" IS NULL OR "{task_column}" <> %s)
+                    """,
+                    (business_id, task_key, business_id),
+                )
+    pg.commit()
+    return True
 
 
 def _task_id_conflict_clause(task_column: str) -> str:
@@ -1140,6 +1234,55 @@ def filter_sent_tasks_from_result(
     return hidden
 
 
+def _fetch_geometry_json_by_task_key(
+    conn: DatabaseConnection,
+    task_key: str,
+    store_cfg: Dict[str, Any],
+) -> Optional[str]:
+    import json
+
+    from .config import load_layers_config
+
+    pg = _pg_connection(conn)
+    if pg is None:
+        return None
+    cfg = load_layers_config()
+    crm_cfg = cfg.get("crm_tasks", {})
+    for group_cfg in crm_cfg.get("groups", []):
+        for sub_cfg in group_cfg.get("subgroups", []):
+            subgroup_name = sub_cfg.get("name", "")
+            mapping = store_cfg.get("subgroups", {}).get(subgroup_name)
+            if not mapping or not mapping.get("scoped_geometry_id"):
+                continue
+            for layer_ref in sub_cfg.get("layers", []):
+                layer_name = layer_ref if isinstance(layer_ref, str) else layer_ref.get("name")
+                for lg in cfg.get("layer_groups", []):
+                    for grp in lg.get("groups", []):
+                        for layer_def in grp.get("layers", []):
+                            if layer_def.get("display_name") != layer_name:
+                                continue
+                            schema_name = layer_def.get("schema", "data_mos")
+                            table_name = layer_def.get("table_name")
+                            geom_col = layer_def.get("geometry_column", "geom")
+                            if not table_name:
+                                continue
+                            qualified = f"{schema_name}.{table_name}"
+                            with pg.cursor() as cur:
+                                cur.execute(
+                                    f"""
+                                    SELECT ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))
+                                    FROM {qualified}
+                                    WHERE task_key = %s::uuid
+                                    LIMIT 1
+                                    """,
+                                    (task_key,),
+                                )
+                                row = cur.fetchone()
+                            if row and row[0]:
+                                return row[0] if isinstance(row[0], str) else json.dumps(row[0])
+    return None
+
+
 def send_task_snapshot(
     conn: DatabaseConnection,
     record: TaskRecord,
@@ -1149,6 +1292,7 @@ def send_task_snapshot(
     login: str,
     *,
     office_comment: Optional[str] = None,
+    rayon: Optional[str] = None,
 ) -> SendTaskSnapshotResult:
     """Сохранить снимок задачи в таблицу-снимок (без повторов по task_key)."""
     schema, table = _snapshot_table_ref(store_cfg, config_key, default_table)
@@ -1184,11 +1328,23 @@ def send_task_snapshot(
     ]
     audit = make_user_audit(login)
     values += [audit, audit]
+    geom_json = None
     if config_key == "field_table":
-        columns = list(columns) + ["office_comment"]
+        from .crm_ui_constants import normalize_rayon_name
+
+        columns = list(columns) + ["office_comment", "rayon"]
         values.append(_normalize_office_comment(office_comment))
+        values.append(normalize_rayon_name(rayon or "") or None)
+        geom_json = _fetch_geometry_json_by_task_key(conn, record.key, store_cfg)
+        if geom_json:
+            columns = list(columns) + ["geom"]
+            values.append(geom_json)
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
+    if config_key == "field_table" and geom_json:
+        ph_list = ["%s"] * len(columns)
+        ph_list[columns.index("geom")] = "ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)"
+        placeholders = ", ".join(ph_list)
     query = (
         f'INSERT INTO "{schema}"."{table}" ({col_list}) '
         f"VALUES ({placeholders})"
@@ -1228,7 +1384,14 @@ def send_task_to_field(
     login: str,
     *,
     office_comment: Optional[str] = None,
+    rayon: Optional[str] = None,
 ) -> SendTaskSnapshotResult:
+    if rayon:
+        from .crm_ui_constants import normalize_rayon_name
+
+        rayon_norm = normalize_rayon_name(rayon)
+        if not rayon_norm:
+            raise ValueError("Район не указан")
     return send_task_snapshot(
         conn,
         record,
@@ -1237,6 +1400,7 @@ def send_task_to_field(
         "tasks_field",
         login,
         office_comment=office_comment,
+        rayon=rayon,
     )
 
 
@@ -1502,7 +1666,7 @@ def _task_exists(cur, schema: str, table: str, column: str, value: str) -> bool:
 
 def _insert_task(
     cur, schema: str, table: str, row: Dict[str, Any], login: str
-) -> bool:
+) -> Optional[str]:
     task_column = next(col for col in TASK_ID_COLUMNS if row[col] is not None)
     audit = make_user_audit(login)
     columns = ["type"] + list(TASK_ID_COLUMNS) + list(USER_AUDIT_COLUMNS)
@@ -1511,17 +1675,25 @@ def _insert_task(
     col_list = ", ".join(f'"{col}"' for col in columns)
     query = (
         f'INSERT INTO "{schema}"."{table}" ({col_list}) VALUES ({placeholders}) '
-        f"{_task_id_conflict_clause(task_column)}"
+        f"{_task_id_conflict_clause(task_column)} RETURNING key::text"
     )
     try:
         cur.execute(query, values)
+        row = cur.fetchone()
+        return str(row[0]) if row else None
     except Exception as exc:
         if psycopg2 is not None and isinstance(
             exc, psycopg2.errors.UniqueViolation
         ):
-            return False
+            return None
         raise
-    return cur.rowcount > 0
+
+
+    return linked
+
+
+def _insert_task_legacy(cur, schema: str, table: str, row: Dict[str, Any], login: str) -> bool:
+    return _insert_task(cur, schema, table, row, login) is not None
 
 
 def persist_task_result(
@@ -1553,6 +1725,7 @@ def persist_task_result(
         with pg.cursor() as cur:
             for group in task_result.groups:
                 for subgroup in group.subgroups:
+                    mapping = store_cfg.get("subgroups", {}).get(subgroup.name, {})
                     for task_feat in subgroup.features:
                         row = task_row_from_feature(
                             group.name,
@@ -1576,9 +1749,64 @@ def persist_task_result(
                             continue
                         seen.add(lookup)
 
-                        if _insert_task(cur, schema, table, row, login):
+                        source_field = mapping.get("source_field", "id")
+                        row_id = task_feat.attributes.get(source_field)
+                        global_id = task_feat.attributes.get("global_id")
+                        geom_type = layer_geometry_type(task_feat.layer)
+                        qualified_table = None
+                        if task_feat.layer is not None:
+                            schema_name = (
+                                task_feat.layer.dataProvider().uri().schema()
+                                or "data_mos"
+                            )
+                            table_name = task_feat.layer.dataProvider().uri().table()
+                            if table_name:
+                                qualified_table = f"{schema_name}.{table_name}"
+
+                        if global_id is not None and qualified_table:
+                            with pg.cursor() as hash_cur:
+                                hash_cur.execute(
+                                    f"""
+                                    SELECT {_geom_hash_expr("geom")}
+                                    FROM {qualified_table}
+                                    WHERE id = %s
+                                    """,
+                                    (row_id,),
+                                )
+                                hash_row = hash_cur.fetchone()
+                            geom_hash = hash_row[0] if hash_row else None
+                            if geom_hash:
+                                existing_key = find_task_by_source_anchor(
+                                    conn, global_id, geom_hash, task_column
+                                )
+                                if existing_key:
+                                    if row_id is not None:
+                                        link_items_task_key(
+                                            conn,
+                                            existing_key,
+                                            qualified_table,
+                                            row_id,
+                                            global_id=global_id,
+                                            task_column=task_column,
+                                            geometry_type=geom_type,
+                                        )
+                                    stats.skipped += 1
+                                    continue
+
+                        task_key = _insert_task(cur, schema, table, row, login)
+                        if task_key:
                             stats.inserted += 1
-                            task_index[lookup] = ""
+                            task_index[lookup] = task_key
+                            if qualified_table and row_id is not None:
+                                link_items_task_key(
+                                    conn,
+                                    task_key,
+                                    qualified_table,
+                                    row_id,
+                                    global_id=global_id,
+                                    task_column=task_column,
+                                    geometry_type=geom_type,
+                                )
                         else:
                             stats.skipped += 1
 

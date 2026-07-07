@@ -1326,6 +1326,14 @@ class TaskDialog(QDialog):
 
         from .task_edit_dialog import TaskEditDialog
 
+        active_task_keys: set[str] = set()
+        if self._task_source == "active":
+            for group in self._result.groups:
+                for subgroup in group.subgroups:
+                    for feat in subgroup.features:
+                        if feat.task_key:
+                            active_task_keys.add(str(feat.task_key))
+
         def _on_edit_closed(_result: int) -> None:
             self._on_refresh()
 
@@ -1344,6 +1352,8 @@ class TaskDialog(QDialog):
             feature_attributes=self._selected_task_feat.attributes,
             office_working=self._office_working(),
             on_start_place_office_point=self.start_place_office_point_from_edit,
+            district_name=self._result.district_name,
+            active_task_keys=active_task_keys,
         )
 
     def _current_user_login(self) -> str:

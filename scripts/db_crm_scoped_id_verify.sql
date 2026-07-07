@@ -1,6 +1,7 @@
 -- Verification queries for scoped business id on crm.tasks.
--- Run after MONITOR_WEBCRM/sql/19_scoped_geometry_task_ids.sql and
--- MONITOR_WEBCRM/sql/20_oati_scoped_geometry_tasks.sql.
+-- Run after MONITOR_WEBCRM/sql/19_scoped_geometry_task_ids.sql,
+-- MONITOR_WEBCRM/sql/20_oati_scoped_geometry_tasks.sql, and
+-- MONITOR_WEBCRM/sql/21_localwork_avr_scoped_geometry_tasks.sql.
 --
 -- Usage: psql -h HOST -U monitor -d monitor -f scripts/db_crm_scoped_id_verify.sql
 
@@ -49,3 +50,23 @@ WHERE schemaname = 'crm'
   AND tablename = 'tasks'
   AND indexname LIKE 'tasks_uq_%'
 ORDER BY indexname;
+
+\echo '=== 6. Legacy localwork/avr order tasks without scoped prefix (expect 0 after migration 21) ==='
+SELECT key, localwork_id, avr_mos_id, type
+FROM crm.tasks
+WHERE type = 'Новые ордера ОАТИ, АВР и земляные работы'
+  AND (
+      (localwork_id IS NOT NULL AND localwork_id !~ '^(point|line|polygon):')
+      OR (avr_mos_id IS NOT NULL AND avr_mos_id !~ '^(point|line|polygon):')
+  )
+LIMIT 20;
+
+\echo '=== 7. Legacy numeric localwork/avr ids (expect 0 after migration 21 + re-collect) ==='
+SELECT key, localwork_id, avr_mos_id
+FROM crm.tasks
+WHERE type = 'Новые ордера ОАТИ, АВР и земляные работы'
+  AND (
+      localwork_id ~ '^[0-9]+$'
+      OR avr_mos_id ~ '^[0-9]+$'
+  )
+LIMIT 20;
