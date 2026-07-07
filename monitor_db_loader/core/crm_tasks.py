@@ -26,9 +26,7 @@ from .auth import (
 )
 from .config import crm_task_store, crm_tasks, database_connection
 from .crm_task_store import (
-    ensure_all_snapshot_tables,
     layer_geometry_type,
-    persist_task_result,
     resolve_task_lookup,
 )
 from .db import DatabaseConnection
@@ -435,81 +433,6 @@ def connect_db(config: Dict[str, Any]) -> Optional[DatabaseConnection]:
     return None
 
 
-def _persist_tasks_to_db(
-    config: Dict[str, Any],
-    task_result: TaskResult,
-    parent,
-    db_conn: Optional[DatabaseConnection] = None,
-    user_session: Optional[UserSession] = None,
-) -> Optional[DatabaseConnection]:
-    store_cfg = crm_task_store(config)
-    if not store_cfg:
-        log_warning("Секция crm_tasks.task_store отсутствует — запись в БД пропущена")
-        return db_conn
-
-    conn = db_conn
-    own_conn = False
-    if conn is None:
-        conn = connect_db(config)
-        own_conn = True
-    if conn is None:
-        log_info("Подключение к БД недоступно")
-        return None
-
-    if not ensure_all_snapshot_tables(conn, store_cfg):
-        log_warning(
-            "Не все snapshot-таблицы CRM подготовлены — "
-            "отправка задач может завершиться ошибкой"
-        )
-
-    if task_result.total_count == 0:
-        log_info(
-            "Нет объектов слоёв для записи в crm.tasks; "
-            "подключение сохранено для площадных заказов"
-        )
-        return conn
-
-    login = user_session.login if user_session else ""
-
-    try:
-        stats = persist_task_result(conn, task_result, store_cfg, login)
-    except Exception as exc:
-        if own_conn:
-            conn.close()
-        QMessageBox.warning(
-            parent,
-            "Мониторинг разрытий — задачи",
-            f"Не удалось записать задачи в БД:\n{exc}\n\n"
-            f"Список объектов будет показан без сохранения.",
-        )
-        return None
-
-    processed = stats.inserted + stats.skipped + stats.invalid
-    if processed == 0:
-        log_info("crm.tasks: нечего записывать (0 объектов с ID на слоях)")
-        return conn
-
-    if stats.inserted > 0 or stats.skipped > 0:
-        QMessageBox.information(
-            parent,
-            "Мониторинг разрытий — задачи",
-            f"Запись в crm.tasks:\n"
-            f"• Добавлено: {stats.inserted}\n"
-            f"• Уже в БД: {stats.skipped}\n"
-            f"• Без ID: {stats.invalid}",
-        )
-    elif stats.invalid > 0:
-        QMessageBox.warning(
-            parent,
-            "Мониторинг разрытий — задачи",
-            f"Не удалось сохранить задачи в crm.tasks:\n"
-            f"• Без ID (нет поля-идентификатора): {stats.invalid}",
-        )
-    if own_conn:
-        return conn
-    return conn
-
-
 def run_get_task(
     config: Dict[str, Any],
     iface,
@@ -701,53 +624,46 @@ def run_get_task(
         )
 
         task_result.task_source = initial_source
-        office_role = role == "office"
 
-        if office_role:
-            if db_conn is None:
-                db_conn = connect_db(config)
-            log_info(
-                "Получить задачу (office): запись в crm.tasks отложена — "
-                "кнопка «Синхронизировать задачи района»"
-            )
-        else:
-            db_conn = _persist_tasks_to_db(
-                config,
-                task_result,
-                parent or iface.mainWindow(),
-                db_conn=db_conn,
-                user_session=user_session,
+        if db_conn is None:
+            db_conn = connect_db(config)
+        if db_conn is not None:
+            from .crm_field_data import append_field_data_to_result
+            from .crm_office_data import append_office_data_to_result
+            from .crm_task_store import (
+                ensure_crm_session_cache,
+                enrich_task_result_field_observed,
+                filter_sent_tasks_from_result,
             )
 
-            if db_conn is not None:
-                from .crm_field_data import append_field_data_to_result
-                from .crm_office_data import append_office_data_to_result
-
-                store_cfg = crm_task_store(config)
-                metric_srid = metric_crs.postgisSrid()
-                if metric_srid <= 0:
-                    auth = metric_crs.authid() or ""
-                    if auth.upper().startswith("EPSG:"):
-                        try:
-                            metric_srid = int(auth.split(":", 1)[1])
-                        except ValueError:
-                            metric_srid = 32637
-                    else:
+            store_cfg = crm_task_store(config)
+            ensure_crm_session_cache(db_conn, store_cfg)
+            filter_sent_tasks_from_result(task_result, db_conn, store_cfg)
+            enrich_task_result_field_observed(task_result, db_conn, store_cfg)
+            metric_srid = metric_crs.postgisSrid()
+            if metric_srid <= 0:
+                auth = metric_crs.authid() or ""
+                if auth.upper().startswith("EPSG:"):
+                    try:
+                        metric_srid = int(auth.split(":", 1)[1])
+                    except ValueError:
                         metric_srid = 32637
-                append_field_data_to_result(
-                    task_result,
-                    db_conn,
-                    district,
-                    store_cfg,
-                    metric_srid,
-                )
-                append_office_data_to_result(
-                    task_result,
-                    db_conn,
-                    district,
-                    store_cfg,
-                    metric_srid,
-                )
+                else:
+                    metric_srid = 32637
+            append_field_data_to_result(
+                task_result,
+                db_conn,
+                district,
+                store_cfg,
+                metric_srid,
+            )
+            append_office_data_to_result(
+                task_result,
+                db_conn,
+                district,
+                store_cfg,
+                metric_srid,
+            )
 
     if db_conn is not None:
         from .crm_tasks_area import preload_area_geometries

@@ -656,6 +656,13 @@ def find_task_by_source_anchor(
     return str(row[0]) if row else None
 
 
+def _parent_table_from_split(items_table: str) -> Optional[str]:
+    for suffix in ("_points", "_lines", "_polygons"):
+        if items_table.endswith(suffix):
+            return items_table[: -len(suffix)]
+    return None
+
+
 def link_items_task_key(
     conn: DatabaseConnection,
     task_key: str,
@@ -718,6 +725,19 @@ def link_items_task_key(
                     """,
                     (business_id, task_key, business_id),
                 )
+        parent_table = _parent_table_from_split(qualified_table)
+        if parent_table:
+            cur.execute(
+                f"""
+                UPDATE {parent_table} p
+                SET tasked = true
+                FROM {qualified_table} t
+                WHERE t.id = %s
+                  AND p.id = t.source_id
+                  AND t.source_id IS NOT NULL
+                """,
+                (row_id_int,),
+            )
     pg.commit()
     return True
 

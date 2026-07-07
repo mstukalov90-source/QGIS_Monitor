@@ -52,7 +52,6 @@ from ..core.crm_task_store import (
     fetch_task_by_key,
     fetch_task_for_feature,
     filter_sent_tasks_from_result,
-    persist_task_result,
 )
 from ..core.crm_tasks import (
     TaskFeature,
@@ -206,7 +205,6 @@ class TaskDialog(QDialog):
         self._source_tabs.completeOrderClicked.connect(self._on_complete_office_order)
         self._source_tabs.ordersToggleClicked.connect(self._on_office_orders_toggle)
         self._source_tabs.selectOrderClicked.connect(self._open_office_order_picker)
-        self._source_tabs.syncDistrictClicked.connect(self._on_sync_district_tasks)
         self._source_tabs.placePointClicked.connect(self._on_toggle_place_point)
         layout.addWidget(self._source_tabs)
 
@@ -563,93 +561,6 @@ class TaskDialog(QDialog):
             else:
                 metric_srid = 32637
         return metric_srid
-
-    def _on_sync_district_tasks(self) -> None:
-        if not self._is_office_user() or not self._config or not self._district:
-            QMessageBox.warning(
-                self,
-                "Monitor CRM",
-                "Синхронизация недоступна: нужны конфигурация и район.",
-            )
-            return
-        conn = self._get_db_connection()
-        if conn is None:
-            return
-
-        source_result = (
-            self._office_full_result or self._active_result or self._result
-        )
-        progress = QProgressDialog(
-            "Синхронизация задач района…", None, 0, 0, self
-        )
-        progress.setWindowTitle("Monitor CRM")
-        progress.setMinimumDuration(0)
-        progress.show()
-
-        try:
-            from ..core.crm_field_data import append_field_data_to_result
-            from ..core.crm_office_data import append_office_data_to_result
-
-            ensure_all_snapshot_tables(conn, self._store_cfg)
-            login = self._current_user_login()
-            stats = persist_task_result(
-                conn, source_result, self._store_cfg, login
-            )
-            ensure_crm_session_cache(conn, self._store_cfg, force_reload=True)
-            metric_srid = self._metric_srid()
-            append_field_data_to_result(
-                source_result,
-                conn,
-                self._district,
-                self._store_cfg,
-                metric_srid,
-            )
-            append_office_data_to_result(
-                source_result,
-                conn,
-                self._district,
-                self._store_cfg,
-                metric_srid,
-            )
-
-            self._office_full_result = copy_task_result(source_result)
-            self._active_result = copy_task_result(source_result)
-            self._invalidate_office_filter_cache()
-            self._apply_snapshot_filter()
-
-            layer_stats = create_task_layers_in_qgis(
-                self._iface,
-                conn,
-                self._district,
-                self._config,
-                self._allowed_sources,
-                active_result=self._active_result,
-                parent=self,
-            )
-
-            lines = [
-                f"Добавлено в crm.tasks: {stats.inserted}",
-                f"Уже в БД: {stats.skipped}",
-                f"Без ID: {stats.invalid}",
-                f"Слоёв QGIS: {layer_stats.layers_created}",
-                f"Объектов на слоях: {layer_stats.features_added}",
-            ]
-            if layer_stats.warnings:
-                lines.append("")
-                lines.extend(f"• {w}" for w in layer_stats.warnings)
-            QMessageBox.information(
-                self,
-                "Monitor CRM — синхронизация",
-                "Синхронизация задач района завершена.\n\n" + "\n".join(lines),
-            )
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Monitor CRM — синхронизация",
-                f"Не удалось синхронизировать задачи района:\n{exc}",
-            )
-        finally:
-            progress.close()
 
     def _on_pause_office_order(self) -> None:
         if not self._office_working():
