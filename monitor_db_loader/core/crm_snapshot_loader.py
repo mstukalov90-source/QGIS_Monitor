@@ -48,7 +48,6 @@ class SnapshotRow:
     group_name: str
     office_comment: Optional[str] = None
     rayon: Optional[str] = None
-    geom_json: Optional[str] = None
 
 
 def _lookup_feature_by_task_key_db(
@@ -167,10 +166,7 @@ def fetch_snapshot_rows(
     if include_office_comment:
         columns.append("office_comment")
         columns.append("rayon")
-        columns.append("geom")
-    col_list = ", ".join(
-        'ST_AsGeoJSON(geom) AS geom' if c == "geom" else f'"{c}"' for c in columns
-    )
+    col_list = ", ".join(f'"{c}"' for c in columns)
 
     filters: List[str] = []
     params: List[Any] = []
@@ -208,15 +204,12 @@ def fetch_snapshot_rows(
                 )
                 office_comment = None
                 rayon_value = None
-                geom_json = None
                 if include_office_comment and len(row) > 14 and row[14] is not None:
                     text = str(row[14]).strip()
                     office_comment = text or None
                 if include_office_comment and len(row) > 15 and row[15] is not None:
                     text = str(row[15]).strip()
                     rayon_value = text or None
-                if include_office_comment and len(row) > 16 and row[16] is not None:
-                    geom_json = row[16]
                 resolved = _find_subgroup_for_record(record, store_cfg)
                 if resolved is None:
                     continue
@@ -237,7 +230,6 @@ def fetch_snapshot_rows(
                         group_name=group_name,
                         office_comment=office_comment,
                         rayon=rayon_value,
-                        geom_json=geom_json,
                     )
                 )
     except Exception as exc:
@@ -343,19 +335,6 @@ def lookup_feature_in_layers(
     conn: Optional[DatabaseConnection] = None,
 ) -> Optional[TaskFeature]:
     """Найти геометрию задачи: task_key в БД, затем business_id в слоях."""
-    if snap.geom_json:
-        import json
-
-        geom = json.loads(snap.geom_json) if isinstance(snap.geom_json, str) else snap.geom_json
-        return TaskFeature(
-            layer=None,
-            layer_name=snap.subgroup_name,
-            feature_id=None,
-            attributes={"_task_key": snap.task_key, "_snapshot_key": snap.snapshot_key},
-            task_key=snap.task_key,
-            sent_at=snap.sent_at,
-            task_geom=geom,
-        )
     if conn is not None:
         feat = _lookup_feature_by_task_key_db(conn, snap, store_cfg, crm_cfg)
         if feat is not None:

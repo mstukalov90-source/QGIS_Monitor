@@ -385,6 +385,24 @@ def _build_task_result(
                 )
                 continue
 
+            if sub_cfg.get("source") == "etl_sync":
+                group.subgroups.append(
+                    TaskSubgroup(name=sub_name, features=[])
+                )
+                log_info(
+                    f"CRM подгруппа «{sub_name}»: загрузка из crm.tasks (ETL)"
+                )
+                continue
+
+            if is_etl_photo_subgroup(store_cfg, sub_name):
+                group.subgroups.append(
+                    TaskSubgroup(name=sub_name, features=[])
+                )
+                log_info(
+                    f"CRM подгруппа «{sub_name}»: загрузка из crm.tasks (ETL)"
+                )
+                continue
+
             layer_names = sub_cfg.get("layers", [])
             group_names = sub_cfg.get("groups", [])
             layers, missing = resolve_layers(root, layer_names, group_names)
@@ -628,6 +646,7 @@ def run_get_task(
         if db_conn is None:
             db_conn = connect_db(config)
         if db_conn is not None:
+            from .crm_etl_photo_data import append_etl_photo_tasks_to_result
             from .crm_field_data import append_field_data_to_result
             from .crm_office_data import append_office_data_to_result
             from .crm_task_store import (
@@ -663,6 +682,14 @@ def run_get_task(
                 district,
                 store_cfg,
                 metric_srid,
+            )
+            append_etl_photo_tasks_to_result(
+                task_result,
+                db_conn,
+                district,
+                store_cfg,
+                metric_srid,
+                config,
             )
 
     if db_conn is not None:

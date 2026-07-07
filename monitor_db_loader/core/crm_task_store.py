@@ -1389,23 +1389,14 @@ def send_task_snapshot(
     ]
     audit = make_user_audit(login)
     values += [audit, audit]
-    geom_json = None
     if config_key == "field_table":
         from .crm_ui_constants import normalize_rayon_name
 
         columns = list(columns) + ["office_comment", "rayon"]
         values.append(_normalize_office_comment(office_comment))
         values.append(normalize_rayon_name(rayon or "") or None)
-        geom_json = _fetch_geometry_json_by_task_key(conn, record.key, store_cfg)
-        if geom_json:
-            columns = list(columns) + ["geom"]
-            values.append(geom_json)
     placeholders = ", ".join(["%s"] * len(columns))
     col_list = ", ".join(f'"{col}"' for col in columns)
-    if config_key == "field_table" and geom_json:
-        ph_list = ["%s"] * len(columns)
-        ph_list[columns.index("geom")] = "ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)"
-        placeholders = ", ".join(ph_list)
     query = (
         f'INSERT INTO "{schema}"."{table}" ({col_list}) '
         f"VALUES ({placeholders})"
