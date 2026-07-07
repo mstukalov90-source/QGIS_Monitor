@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Сохранение задач CRM в PostgreSQL (crm.tasks)."""
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
@@ -593,6 +594,43 @@ def _geom_hash_expr(geom_col: str = "geom") -> str:
     return f"md5(ST_AsEWKB(ST_SetSRID(ST_MakeValid({geom_col}), 4326)))"
 
 
+_ITEMS_LINK_TABLE_RE = re.compile(
+    r"^data_mos\.items_\d+_(points|lines|polygons)$"
+)
+
+
+def _is_data_mos_items_table(qualified_table: Optional[str]) -> bool:
+    return bool(qualified_table and _ITEMS_LINK_TABLE_RE.match(qualified_table))
+
+
+def _coerce_items_row_id(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or ":" in text:
+        return None
+    try:
+        return int(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _resolve_items_row_id(
+    attributes: Dict[str, Any],
+    mapping: Dict[str, Any],
+    business_id: str,
+) -> Optional[int]:
+    """Numeric items_* row id for scoped geometry tasks only."""
+    if not mapping.get("scoped_geometry_id"):
+        return None
+    source_field = mapping.get("source_field", "id")
+    row_id = _coerce_items_row_id(attributes.get(source_field))
+    if row_id is not None:
+        return row_id
+    _, raw_business_id = parse_scoped_business_id(str(business_id))
+    return _coerce_items_row_id(raw_business_id)
+
+
 def find_task_by_source_anchor(
     conn: DatabaseConnection,
     global_id: Any,
@@ -630,7 +668,10 @@ def link_items_task_key(
     geometry_type: Optional[str] = None,
 ) -> bool:
     """Write task_key on items row and source anchor on crm.tasks."""
-    if row_id is None:
+    if not _is_data_mos_items_table(qualified_table):
+        return False
+    row_id_int = _coerce_items_row_id(row_id)
+    if row_id_int is None:
         return False
     pg = _pg_connection(conn)
     if pg is None:
@@ -643,19 +684,19 @@ def link_items_task_key(
             WHERE id = %s
               AND (task_key IS NULL OR task_key = %s::uuid)
             """,
-            (task_key, row_id, task_key),
+            (task_key, row_id_int, task_key),
         )
         if cur.rowcount == 0:
             return False
         anchor_sets = ["source_table = %s", "source_row_id = %s"]
-        anchor_params: List[Any] = [qualified_table, row_id]
+        anchor_params: List[Any] = [qualified_table, row_id_int]
         if global_id is not None:
             anchor_sets.append("source_global_id = %s")
             anchor_params.append(global_id)
         anchor_sets.append(
             f"source_geom_hash = {_geom_hash_expr(f't.\"{geom_col}\"')}"
         )
-        anchor_params.extend([task_key, row_id])
+        anchor_params.extend([task_key, row_id_int])
         cur.execute(
             f"""
             UPDATE crm.tasks ct
@@ -666,7 +707,7 @@ def link_items_task_key(
             anchor_params,
         )
         if task_column and geometry_type:
-            business_id = format_scoped_business_id(geometry_type, row_id)
+            business_id = format_scoped_business_id(geometry_type, row_id_int)
             if business_id:
                 cur.execute(
                     f"""
@@ -1689,9 +1730,6 @@ def _insert_task(
         raise
 
 
-    return linked
-
-
 def _insert_task_legacy(cur, schema: str, table: str, row: Dict[str, Any], login: str) -> bool:
     return _insert_task(cur, schema, table, row, login) is not None
 
@@ -1749,8 +1787,9 @@ def persist_task_result(
                             continue
                         seen.add(lookup)
 
-                        source_field = mapping.get("source_field", "id")
-                        row_id = task_feat.attributes.get(source_field)
+                        row_id = _resolve_items_row_id(
+                            task_feat.attributes, mapping, business_id
+                        )
                         global_id = task_feat.attributes.get("global_id")
                         geom_type = layer_geometry_type(task_feat.layer)
                         qualified_table = None
@@ -1763,7 +1802,11 @@ def persist_task_result(
                             if table_name:
                                 qualified_table = f"{schema_name}.{table_name}"
 
-                        if global_id is not None and qualified_table:
+                        if (
+                            global_id is not None
+                            and row_id is not None
+                            and _is_data_mos_items_table(qualified_table)
+                        ):
                             with pg.cursor() as hash_cur:
                                 hash_cur.execute(
                                     f"""
@@ -1780,16 +1823,15 @@ def persist_task_result(
                                     conn, global_id, geom_hash, task_column
                                 )
                                 if existing_key:
-                                    if row_id is not None:
-                                        link_items_task_key(
-                                            conn,
-                                            existing_key,
-                                            qualified_table,
-                                            row_id,
-                                            global_id=global_id,
-                                            task_column=task_column,
-                                            geometry_type=geom_type,
-                                        )
+                                    link_items_task_key(
+                                        conn,
+                                        existing_key,
+                                        qualified_table,
+                                        row_id,
+                                        global_id=global_id,
+                                        task_column=task_column,
+                                        geometry_type=geom_type,
+                                    )
                                     stats.skipped += 1
                                     continue
 
@@ -1797,7 +1839,9 @@ def persist_task_result(
                         if task_key:
                             stats.inserted += 1
                             task_index[lookup] = task_key
-                            if qualified_table and row_id is not None:
+                            if row_id is not None and _is_data_mos_items_table(
+                                qualified_table
+                            ):
                                 link_items_task_key(
                                     conn,
                                     task_key,
