@@ -2,7 +2,6 @@
 """Сбор задач CRM по району."""
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from qgis.core import (
@@ -13,7 +12,7 @@ from qgis.core import (
     QgsProject,
     QgsVectorLayer,
 )
-from qgis.PyQt.QtCore import QDate, QDateTime
+from qgis.PyQt.QtCore import QDate
 from qgis.PyQt.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from ..ui.district_dialog import DistrictDialog
@@ -25,17 +24,11 @@ from .auth import (
     filter_rayons_on_layer,
 )
 from .config import crm_task_store, crm_tasks, database_connection
-from .crm_task_store import (
-    layer_geometry_type,
-    resolve_task_lookup,
-)
 from .db import DatabaseConnection
 from .district_utils import (
     DistrictBoundary,
-    features_in_district,
     find_layer_by_name,
     load_district_boundary,
-    resolve_layers,
 )
 from .district_utils import WGS84
 from .log_util import log_info, log_warning
@@ -126,70 +119,11 @@ def copy_task_result(result: TaskResult) -> TaskResult:
     )
 
 
-_DATE_TEXT_FORMATS = (
-    "dd.MM.yyyy",
-    "yyyy-MM-dd",
-    "dd.MM.yyyy HH:mm:ss",
-    "yyyy-MM-dd HH:mm:ss",
-    "yyyy-MM-ddTHH:mm:ss",
-)
-
-
-def _parse_text_date(text: str) -> Optional[QDate]:
-    text = text.strip()
-    if not text:
-        return None
-    candidates = [text]
-    if len(text) >= 10:
-        candidates.append(text[:10])
-    if len(text) >= 19:
-        candidates.append(text[:19])
-    seen = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        for fmt in _DATE_TEXT_FORMATS:
-            parsed = QDate.fromString(candidate, fmt)
-            if parsed.isValid():
-                return parsed
-    return None
-
-
-def _feature_date_value(feat: QgsFeature, field_name: str) -> Optional[QDate]:
-    idx = feat.fields().indexOf(field_name)
-    if idx < 0:
-        return None
-    val = feat[field_name]
-    if val is None:
-        return None
-    if isinstance(val, QDate):
-        return val if val.isValid() else None
-    if isinstance(val, QDateTime):
-        return val.date() if val.isValid() else None
-    if isinstance(val, datetime):
-        return QDate(val.year, val.month, val.day)
-    if isinstance(val, date):
-        return QDate(val.year, val.month, val.day)
-    return _parse_text_date(str(val))
-
 
 def _date_filter_range(lookback_days: int) -> Tuple[QDate, QDate]:
     """Интервал от (сегодня − lookback_days) до сегодня включительно."""
     today = QDate.currentDate()
     return today.addDays(-lookback_days), today
-
-
-def _feature_matches_date_range(
-    feat: QgsFeature,
-    field_name: str,
-    date_from: QDate,
-    date_to: QDate,
-) -> bool:
-    feat_date = _feature_date_value(feat, field_name)
-    if feat_date is None:
-        return False
-    return date_from <= feat_date <= date_to
 
 
 def _feature_geom_wgs84(
@@ -220,128 +154,48 @@ def _feature_to_task(layer: QgsVectorLayer, feat: QgsFeature) -> TaskFeature:
     )
 
 
-def _collect_subgroup_features(
-    layers: List[QgsVectorLayer],
-    district: DistrictBoundary,
-    metric_crs: QgsCoordinateReferenceSystem,
-    date_field: Optional[str],
-    date_from: QDate,
-    date_to: QDate,
-    subgroup_name: str,
-) -> List[TaskFeature]:
-    collected: List[TaskFeature] = []
-    warned_missing_field = False
-    warned_date_sample = False
-
-    for layer in layers:
-        layer_count = 0
-        in_district = 0
-        for feat in features_in_district(layer, district, metric_crs):
-            in_district += 1
-            if date_field:
-                if layer.fields().indexOf(date_field) < 0:
-                    if not warned_missing_field:
-                        log_warning(
-                            f"Подгруппа «{subgroup_name}»: в слое «{layer.name()}» "
-                            f"нет поля «{date_field}»"
-                        )
-                        warned_missing_field = True
-                    continue
-                if not _feature_matches_date_range(
-                    feat, date_field, date_from, date_to
-                ):
-                    if not warned_date_sample and feat[date_field]:
-                        parsed = _feature_date_value(feat, date_field)
-                        log_info(
-                            f"  CRM «{subgroup_name}»: пример даты "
-                            f"{feat[date_field]!r} → "
-                            f"{parsed.toString('yyyy-MM-dd') if parsed else 'не распознана'}, "
-                            f"период {date_from.toString('dd.MM.yyyy')}–"
-                            f"{date_to.toString('dd.MM.yyyy')}"
-                        )
-                        warned_date_sample = True
-                    continue
-            collected.append(_feature_to_task(layer, feat))
-            layer_count += 1
-
-        log_info(
-            f"  CRM «{subgroup_name}» / «{layer.name()}»: "
-            f"{layer_count} объектов (в районе: {in_district})"
-        )
-
-    return collected
-
-
-_GEOMETRY_LAYER_PRIORITY = {"point": 0, "line": 1, "polygon": 2}
-
-
-def _layer_geometry_priority(layer: Optional[QgsVectorLayer]) -> int:
-    gtype = layer_geometry_type(layer)
-    if gtype is None:
-        return 99
-    return _GEOMETRY_LAYER_PRIORITY.get(gtype, 99)
-
-
-def dedupe_subgroup_features(
-    features: List[TaskFeature],
-    subgroup_name: str,
-    store_cfg: Dict[str, Any],
-) -> List[TaskFeature]:
-    """Одна feature на business_id; для scoped_geometry_id — отдельная строка на геометрию."""
-    best_by_business: Dict[Tuple[str, str], TaskFeature] = {}
-    best_by_task_key: Dict[str, TaskFeature] = {}
-    unkeyed: List[TaskFeature] = []
-
-    mapping = store_cfg.get("subgroups", {}).get(subgroup_name, {})
-    scoped = bool(mapping.get("scoped_geometry_id"))
-
-    for feat in features:
-        lookup = resolve_task_lookup(
-            subgroup_name,
-            feat.attributes,
-            store_cfg,
-            layer=feat.layer,
-        )
-        if lookup:
-            if scoped:
-                if lookup not in best_by_business:
-                    best_by_business[lookup] = feat
-                continue
-            existing = best_by_business.get(lookup)
-            if existing is None:
-                best_by_business[lookup] = feat
-                continue
-            if _layer_geometry_priority(feat.layer) < _layer_geometry_priority(
-                existing.layer
-            ):
-                best_by_business[lookup] = feat
-            continue
-
-        task_key = feat.task_key
-        if task_key:
-            if task_key not in best_by_task_key:
-                best_by_task_key[task_key] = feat
-            continue
-        unkeyed.append(feat)
-
-    return (
-        list(best_by_business.values())
-        + list(best_by_task_key.values())
-        + unkeyed
+def _feature_to_task(layer: QgsVectorLayer, feat: QgsFeature) -> TaskFeature:
+    attrs = {f.name(): feat[f.name()] for f in feat.fields()}
+    return TaskFeature(
+        layer=layer,
+        layer_name=layer.name(),
+        feature_id=feat.id(),
+        attributes=attrs,
+        task_geom=_feature_geom_wgs84(layer, feat),
     )
 
 
-def _build_task_result(
+def _metric_srid(metric_crs: QgsCoordinateReferenceSystem) -> int:
+    metric_srid = metric_crs.postgisSrid()
+    if metric_srid > 0:
+        return metric_srid
+    auth = metric_crs.authid() or ""
+    if auth.upper().startswith("EPSG:"):
+        try:
+            return int(auth.split(":", 1)[1])
+        except ValueError:
+            pass
+    return 32637
+
+
+def _build_task_result_from_db(
     cfg: Dict[str, Any],
     district: DistrictBoundary,
     metric_crs: QgsCoordinateReferenceSystem,
-    root,
     date_from: QDate,
     date_to: QDate,
     apply_date_filter: bool,
     progress: QProgressDialog,
     store_cfg: Dict[str, Any],
+    config: Dict[str, Any],
+    db_conn: DatabaseConnection,
 ) -> tuple:
+    from .crm_db_tasks import (
+        collect_db_subgroup_tasks,
+        is_db_loaded_subgroup,
+        is_deferred_subgroup,
+    )
+
     result = TaskResult(
         district_name=district.name,
         filter_date_from=date_from,
@@ -349,10 +203,9 @@ def _build_task_result(
         apply_date_filter=apply_date_filter,
     )
     groups_cfg = cfg.get("groups", [])
-    total_steps = sum(
-        len(group.get("subgroups", [])) for group in groups_cfg
-    )
+    total_steps = sum(len(group.get("subgroups", [])) for group in groups_cfg)
     step = 0
+    metric_srid = _metric_srid(metric_crs)
 
     for group_cfg in groups_cfg:
         group = TaskGroup(name=group_cfg.get("name", ""))
@@ -361,68 +214,53 @@ def _build_task_result(
             progress.setValue(step)
             sub_name = sub_cfg.get("name", "")
             progress.setLabelText(
-                f"Слой {step}/{total_steps}: {sub_name}…"
+                f"Загрузка {step}/{total_steps}: {sub_name}…"
             )
             QApplication.processEvents()
             if progress.wasCanceled():
                 return result, True
 
-            if sub_cfg.get("source") == "field_data":
-                group.subgroups.append(
-                    TaskSubgroup(name=sub_name, features=[])
-                )
-                log_info(
-                    f"CRM подгруппа «{sub_name}»: загрузка из БД после сохранения"
-                )
-                continue
-
-            if sub_cfg.get("source") == "office_data":
-                group.subgroups.append(
-                    TaskSubgroup(name=sub_name, features=[])
-                )
-                log_info(
-                    f"CRM подгруппа «{sub_name}»: загрузка из БД после сохранения"
-                )
-                continue
-
-            if sub_cfg.get("source") == "etl_sync":
-                group.subgroups.append(
-                    TaskSubgroup(name=sub_name, features=[])
-                )
-                log_info(
-                    f"CRM подгруппа «{sub_name}»: загрузка из crm.tasks (ETL)"
-                )
-                continue
-
-            if is_etl_photo_subgroup(store_cfg, sub_name):
-                group.subgroups.append(
-                    TaskSubgroup(name=sub_name, features=[])
-                )
-                log_info(
-                    f"CRM подгруппа «{sub_name}»: загрузка из crm.tasks (ETL)"
-                )
-                continue
-
-            layer_names = sub_cfg.get("layers", [])
-            group_names = sub_cfg.get("groups", [])
-            layers, missing = resolve_layers(root, layer_names, group_names)
-            for name in missing:
-                msg = f"Не найден слой или группа: {name}"
-                log_warning(msg)
-                result.errors.append(msg)
-
             date_field = sub_cfg.get("date_field") if apply_date_filter else None
-            sub_name = sub_cfg.get("name", "")
-            features = _collect_subgroup_features(
-                layers,
+
+            if is_deferred_subgroup(sub_cfg):
+                group.subgroups.append(
+                    TaskSubgroup(
+                        name=sub_name,
+                        features=[],
+                        date_field=date_field,
+                    )
+                )
+                log_info(
+                    f"CRM подгруппа «{sub_name}»: загрузка из БД после сохранения"
+                )
+                continue
+
+            if not is_db_loaded_subgroup(sub_cfg, store_cfg, sub_name):
+                group.subgroups.append(
+                    TaskSubgroup(
+                        name=sub_name,
+                        features=[],
+                        date_field=date_field,
+                    )
+                )
+                log_warning(
+                    f"CRM подгруппа «{sub_name}»: нет маппинга для загрузки из БД"
+                )
+                continue
+
+            features, errors = collect_db_subgroup_tasks(
+                db_conn,
                 district,
-                metric_crs,
-                date_field,
-                date_from,
-                date_to,
+                metric_srid,
                 sub_name,
+                store_cfg,
+                config,
+                sub_cfg,
+                date_from=date_from,
+                date_to=date_to,
+                apply_date_filter=apply_date_filter,
             )
-            features = dedupe_subgroup_features(features, sub_name, store_cfg)
+            result.errors.extend(errors)
             group.subgroups.append(
                 TaskSubgroup(
                     name=sub_name,
@@ -430,9 +268,7 @@ def _build_task_result(
                     date_field=date_field,
                 )
             )
-            log_info(
-                f"CRM подгруппа «{sub_name}»: {len(features)} объектов"
-            )
+            log_info(f"CRM подгруппа «{sub_name}»: {len(features)} объектов")
 
         result.groups.append(group)
 
@@ -606,6 +442,21 @@ def run_get_task(
         if db_conn is None:
             db_conn = connect_db(config)
     else:
+        if db_conn is None:
+            db_conn = connect_db(config)
+        if db_conn is None:
+            QMessageBox.warning(
+                parent or iface.mainWindow(),
+                "Мониторинг разрытий — получить задачу",
+                "Нет подключения к БД.\n\nЗадачи загружаются только из crm.tasks.",
+            )
+            return TaskResult(
+                district_name=district.name,
+                filter_date_from=date_from,
+                filter_date_to=date_to,
+                errors=["Нет подключения к БД"],
+            )
+
         groups_cfg = cfg.get("groups", [])
         total_steps = sum(len(g.get("subgroups", [])) for g in groups_cfg)
         progress = QProgressDialog(
@@ -619,16 +470,18 @@ def run_get_task(
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
-        task_result, canceled = _build_task_result(
+        store_cfg = crm_task_store(config)
+        task_result, canceled = _build_task_result_from_db(
             cfg,
             district,
             metric_crs,
-            root,
             date_from,
             date_to,
             apply_date_filter,
             progress,
-            crm_task_store(config),
+            store_cfg,
+            config,
+            db_conn,
         )
         progress.close()
 
@@ -638,59 +491,37 @@ def run_get_task(
 
         log_info(
             f"Получить задачу завершено: район «{district.name}», "
-            f"объектов на слоях: {task_result.total_count}"
+            f"объектов из БД: {task_result.total_count}"
         )
 
         task_result.task_source = initial_source
 
-        if db_conn is None:
-            db_conn = connect_db(config)
-        if db_conn is not None:
-            from .crm_etl_photo_data import append_etl_photo_tasks_to_result
-            from .crm_field_data import append_field_data_to_result
-            from .crm_office_data import append_office_data_to_result
-            from .crm_task_store import (
-                ensure_crm_session_cache,
-                enrich_task_result_field_observed,
-                filter_sent_tasks_from_result,
-            )
+        from .crm_field_data import append_field_data_to_result
+        from .crm_office_data import append_office_data_to_result
+        from .crm_task_store import (
+            ensure_crm_session_cache,
+            enrich_task_result_field_observed,
+            filter_sent_tasks_from_result,
+        )
 
-            store_cfg = crm_task_store(config)
-            ensure_crm_session_cache(db_conn, store_cfg)
-            filter_sent_tasks_from_result(task_result, db_conn, store_cfg)
-            enrich_task_result_field_observed(task_result, db_conn, store_cfg)
-            metric_srid = metric_crs.postgisSrid()
-            if metric_srid <= 0:
-                auth = metric_crs.authid() or ""
-                if auth.upper().startswith("EPSG:"):
-                    try:
-                        metric_srid = int(auth.split(":", 1)[1])
-                    except ValueError:
-                        metric_srid = 32637
-                else:
-                    metric_srid = 32637
-            append_field_data_to_result(
-                task_result,
-                db_conn,
-                district,
-                store_cfg,
-                metric_srid,
-            )
-            append_office_data_to_result(
-                task_result,
-                db_conn,
-                district,
-                store_cfg,
-                metric_srid,
-            )
-            append_etl_photo_tasks_to_result(
-                task_result,
-                db_conn,
-                district,
-                store_cfg,
-                metric_srid,
-                config,
-            )
+        ensure_crm_session_cache(db_conn, store_cfg)
+        filter_sent_tasks_from_result(task_result, db_conn, store_cfg)
+        enrich_task_result_field_observed(task_result, db_conn, store_cfg)
+        metric_srid = _metric_srid(metric_crs)
+        append_field_data_to_result(
+            task_result,
+            db_conn,
+            district,
+            store_cfg,
+            metric_srid,
+        )
+        append_office_data_to_result(
+            task_result,
+            db_conn,
+            district,
+            store_cfg,
+            metric_srid,
+        )
 
     if db_conn is not None:
         from .crm_tasks_area import preload_area_geometries
@@ -714,16 +545,7 @@ def run_get_task(
             area_progress.close()
 
         store_cfg = crm_task_store(config)
-        metric_srid = metric_crs.postgisSrid()
-        if metric_srid <= 0:
-            auth = metric_crs.authid() or ""
-            if auth.upper().startswith("EPSG:"):
-                try:
-                    metric_srid = int(auth.split(":", 1)[1])
-                except ValueError:
-                    metric_srid = 32637
-            else:
-                metric_srid = 32637
+        metric_srid = _metric_srid(metric_crs)
         from .crm_office_points_map import refresh_office_points_on_map
 
         refresh_office_points_on_map(
