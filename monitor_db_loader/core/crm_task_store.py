@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Сохранение задач CRM в PostgreSQL (crm.tasks)."""
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -68,8 +70,62 @@ TASK_COLUMN_LABELS = {
 TASK_FORM_FIELDS = ("type",) + TASK_ID_COLUMNS
 
 USER_AUDIT_COLUMNS = ("user_created", "user_last_edit")
+ETL_AUDIT_MARKER = "etl"
 
 _audit_columns_ready: Set[str] = set()
+
+
+def is_monitor_owned_task(user_created: Optional[Any]) -> bool:
+    """True when MONITOR ETL created the row (user_created[0] contains 'etl')."""
+    if not user_created:
+        return False
+    try:
+        creator = user_created[0]
+    except (IndexError, KeyError, TypeError):
+        return False
+    return ETL_AUDIT_MARKER in str(creator or "").lower()
+
+
+def merge_task_id_values(
+    existing: Dict[str, Optional[str]],
+    proposed: Dict[str, Optional[str]],
+) -> Dict[str, Optional[str]]:
+    """Keep existing business ids when the form submits an empty field."""
+    merged: Dict[str, Optional[str]] = {}
+    for col in TASK_ID_COLUMNS:
+        proposed_val = proposed.get(col)
+        if proposed_val is not None:
+            merged[col] = proposed_val
+        else:
+            merged[col] = existing.get(col)
+    return merged
+
+
+def validate_monitor_owned_task_update(
+    existing: TaskRecord,
+    merged_ids: Dict[str, Optional[str]],
+    proposed_type: str,
+) -> None:
+    """Reject changes to ETL-owned identifiers or order task type."""
+    for col in TASK_ID_COLUMNS:
+        old_val = _normalize_id_value(getattr(existing, col))
+        new_val = merged_ids.get(col)
+        if not old_val:
+            continue
+        if new_val != old_val:
+            label = TASK_COLUMN_LABELS.get(col, col)
+            if new_val is None:
+                raise ValueError(
+                    f"Нельзя очистить «{label}»: задача создана ETL (MONITOR)"
+                )
+            raise ValueError(
+                f"Нельзя изменить «{label}»: задача создана ETL (MONITOR)"
+            )
+    if (existing.type or "").strip() == CRM_GROUP_ORDERS:
+        if (proposed_type or "").strip() != (existing.type or "").strip():
+            raise ValueError(
+                "Нельзя изменить тип order-задачи, созданной ETL (MONITOR)"
+            )
 
 
 def user_audit_migration_statements(schema: str, table: str) -> Tuple[str, ...]:
@@ -256,6 +312,8 @@ SendTaskSnapshotResult = Literal["inserted", "skipped"]
 SendToFieldResult = SendTaskSnapshotResult
 
 
+@dataclass
+class TaskRecord:
     key: str
     type: str
     photo_uuid: Optional[str] = None
@@ -691,9 +749,8 @@ def link_items_task_key(
         if global_id is not None:
             anchor_sets.append("source_global_id = %s")
             anchor_params.append(global_id)
-        anchor_sets.append(
-            f"source_geom_hash = {_geom_hash_expr(f't.\"{geom_col}\"')}"
-        )
+        geom_ref = f't."{geom_col}"'
+        anchor_sets.append(f"source_geom_hash = {_geom_hash_expr(geom_ref)}")
         anchor_params.extend([task_key, row_id_int])
         cur.execute(
             f"""
@@ -733,6 +790,7 @@ def link_items_task_key(
     return True
 
 
+def layer_geometry_type(layer: Any) -> Optional[str]:
     """point | line | polygon из QgsVectorLayer."""
     if layer is None:
         return None
@@ -1537,6 +1595,30 @@ def fetch_task(
         return None
 
 
+def fetch_task_audit(
+    conn: DatabaseConnection,
+    store_cfg: Dict[str, Any],
+    key: str,
+) -> Optional[List[str]]:
+    schema, table = _table_ref(store_cfg)
+    pg = _pg_connection(conn)
+    if pg is None:
+        return None
+    query = (
+        f'SELECT user_created FROM "{schema}"."{table}" WHERE key = %s LIMIT 1'
+    )
+    _pg_recover_transaction(pg)
+    try:
+        with pg.cursor() as cur:
+            cur.execute(query, (key,))
+            row = cur.fetchone()
+        return list(row[0]) if row and row[0] is not None else None
+    except Exception as exc:
+        _pg_rollback(pg)
+        log_warning(f"Не удалось загрузить user_created (key={key}): {exc}")
+        return None
+
+
 def fetch_task_by_key(
     conn: DatabaseConnection,
     store_cfg: Dict[str, Any],
@@ -1611,8 +1693,12 @@ def task_form_field_groups(
     subgroup_name: Optional[str],
     store_cfg: Dict[str, Any],
     record: TaskRecord,
+    *,
+    monitor_owned: bool = False,
 ) -> Tuple[List[str], List[str]]:
     """Поля формы «Исполнить задачу»: readonly (источник) и link (сопоставление)."""
+    if monitor_owned and (group_name or record.type) == CRM_GROUP_ORDERS:
+        return ["type"] + list(TASK_ID_COLUMNS), []
     if record.is_field_data or subgroup_name == FIELD_DATA_SUBGROUP:
         readonly: List[str] = ["type", "is_field_data"]
         link = list(LINK_COLUMNS_BY_GROUP.get(group_name or "", ()))
@@ -1646,9 +1732,22 @@ def update_task_record(
     if not task_type:
         raise ValueError("Поле «type» не может быть пустым")
 
-    id_values = {
+    existing = fetch_task_by_key(conn, store_cfg, record.key)
+    if existing is None:
+        raise ValueError(f"Задача с ключом {record.key} не найдена")
+
+    proposed_ids = {
         col: _normalize_id_value(getattr(record, col)) for col in TASK_ID_COLUMNS
     }
+    existing_ids = {
+        col: _normalize_id_value(getattr(existing, col)) for col in TASK_ID_COLUMNS
+    }
+    id_values = merge_task_id_values(existing_ids, proposed_ids)
+
+    user_created = fetch_task_audit(conn, store_cfg, record.key)
+    if is_monitor_owned_task(user_created):
+        validate_monitor_owned_task_update(existing, id_values, task_type)
+
     station_values = {
         col: _normalize_id_value(getattr(record, col)) for col in STATION_COLUMNS
     }

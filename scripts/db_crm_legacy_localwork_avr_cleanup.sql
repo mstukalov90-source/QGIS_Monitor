@@ -6,8 +6,10 @@
 -- Does NOT touch earthwork_id / oati_id (already scoped).
 --
 -- Before running: db_crm_legacy_localwork_avr_inventory.sql
+-- Before running: SELECT * FROM crm.tasks_deletion_log ORDER BY deleted_at DESC LIMIT 50;
 -- After this script: re-collect districts from section E of the inventory
 --   via WebCRM or QGIS → «Получить задачу».
+-- After this script: python -m collector.scheduler --run backfill_data_mos_crm_tasks
 --
 -- Usage:
 --   psql -h HOST -U monitor -d monitor -f scripts/db_crm_legacy_localwork_avr_cleanup.sql
@@ -21,6 +23,10 @@ WHERE type = 'Новые ордера ОАТИ, АВР и земляные ра�
   AND (
       (localwork_id IS NOT NULL AND localwork_id !~ '^(point|line|polygon):')
       OR (avr_mos_id IS NOT NULL AND avr_mos_id !~ '^(point|line|polygon):')
+  )
+  AND NOT (
+      user_created IS NOT NULL
+      AND user_created[1] ILIKE '%etl%'
   );
 
 -- Dry-run: SELECT COUNT(*) FROM legacy_localwork_avr_order_tasks;

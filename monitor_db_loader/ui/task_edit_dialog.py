@@ -34,6 +34,8 @@ from ..core.crm_task_store import (
     TASK_COLUMN_LABELS,
     TaskRecord,
     fetch_office_comment,
+    fetch_task_audit,
+    is_monitor_owned_task,
     send_task_to_done_illegal,
     send_task_to_done_legal,
     send_task_to_field,
@@ -170,8 +172,14 @@ class TaskEditDialog(QDialog):
         self._feature_attributes = dict(feature_attributes or {})
         self._office_working = office_working
         self._on_start_place_office_point = on_start_place_office_point
+        user_created = fetch_task_audit(conn, store_cfg, record.key)
+        self._is_monitor_owned = is_monitor_owned_task(user_created)
         self._readonly_fields, self._link_fields = task_form_field_groups(
-            self._group_name, subgroup_name, store_cfg, record
+            self._group_name,
+            subgroup_name,
+            store_cfg,
+            record,
+            monitor_owned=self._is_monitor_owned,
         )
         self._form_fields = self._readonly_fields + self._link_fields + list(STATION_COLUMNS)
         self._fields: Dict[str, QLineEdit] = {}
@@ -212,6 +220,14 @@ class TaskEditDialog(QDialog):
         key_label = QLabel(f"Ключ: {record.key}")
         key_label.setObjectName("crmMuted")
         outer.addWidget(key_label)
+
+        if self._is_monitor_owned and record.type == CRM_GROUP_ORDERS:
+            etl_hint = QLabel(
+                "Задача создана ETL (MONITOR): идентификаторы заказа нельзя менять."
+            )
+            etl_hint.setObjectName("crmMuted")
+            etl_hint.setWordWrap(True)
+            outer.addWidget(etl_hint)
 
         self._observed_label = QLabel(
             f"Обследовано в поле: {format_field_observed(record.field_observed)}"
