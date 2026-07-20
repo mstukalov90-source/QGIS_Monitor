@@ -2,6 +2,7 @@
 """PostgreSQL connection helpers and layer URI building."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from qgis.core import QgsDataSourceUri, QgsVectorLayer
@@ -19,6 +20,18 @@ try:
     import psycopg2
 except ImportError:
     psycopg2 = None  # type: ignore
+
+
+def _plugin_version() -> str:
+    """Read plugin version from metadata.txt (fallback for audit application_name)."""
+    meta_path = Path(__file__).resolve().parents[1] / "metadata.txt"
+    try:
+        for line in meta_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version="):
+                return line.split("=", 1)[1].strip() or "unknown"
+    except OSError:
+        pass
+    return "unknown"
 
 
 @dataclass
@@ -117,6 +130,7 @@ class DatabaseConnection:
             "user": self.username,
             "password": self.password,
             "connect_timeout": 15,
+            "application_name": f"monitor_db_loader/{_plugin_version()}",
             "options": "-c statement_timeout=30000",
         }
 

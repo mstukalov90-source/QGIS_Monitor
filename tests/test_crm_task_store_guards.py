@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import types
 import unittest
@@ -10,6 +11,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _STORE_PATH = _REPO_ROOT / "monitor_db_loader" / "core" / "crm_task_store.py"
+_PLUGIN_ROOT = _REPO_ROOT / "monitor_db_loader"
 
 pytest_skip = False
 try:
@@ -51,11 +53,13 @@ try:
     sys.modules["monitor_db_loader.core.crm_task_store"] = store
     spec.loader.exec_module(store)
 
+    CRM_GROUP_DISRUPTIONS = store.CRM_GROUP_DISRUPTIONS
     CRM_GROUP_ORDERS = store.CRM_GROUP_ORDERS
     TASK_ID_COLUMNS = store.TASK_ID_COLUMNS
     TaskRecord = store.TaskRecord
     is_monitor_owned_task = store.is_monitor_owned_task
     merge_task_id_values = store.merge_task_id_values
+    task_form_field_groups = store.task_form_field_groups
     validate_monitor_owned_task_update = store.validate_monitor_owned_task_update
 except Exception:
     pytest_skip = True
@@ -66,6 +70,9 @@ class CrmTaskStoreGuardsTests(unittest.TestCase):
     def test_is_monitor_owned_task(self) -> None:
         self.assertTrue(is_monitor_owned_task(["etl", "2026-01-01T00:00:00+00:00"]))
         self.assertTrue(is_monitor_owned_task(["ETL", "2026-01-01T00:00:00+00:00"]))
+        self.assertTrue(
+            is_monitor_owned_task(["manager", "etl", "2026-01-01T00:00:00+00:00"])
+        )
         self.assertFalse(is_monitor_owned_task(["manager", "2026-01-01T00:00:00+00:00"]))
         self.assertFalse(is_monitor_owned_task(None))
         self.assertFalse(is_monitor_owned_task([]))
@@ -111,6 +118,33 @@ class CrmTaskStoreGuardsTests(unittest.TestCase):
             )
         self.assertIn("очистить", str(ctx.exception).lower())
 
+    def test_validate_monitor_owned_rejects_changing_id(self) -> None:
+        existing = TaskRecord(
+            key="00000000-0000-0000-0000-000000000001",
+            type=CRM_GROUP_ORDERS,
+            oati_id="point:10",
+        )
+        merged = {col: None for col in TASK_ID_COLUMNS}
+        merged["oati_id"] = "point:99"
+        with self.assertRaises(ValueError) as ctx:
+            validate_monitor_owned_task_update(
+                existing, merged, CRM_GROUP_ORDERS
+            )
+        self.assertIn("изменить", str(ctx.exception).lower())
+
+    def test_validate_monitor_owned_allows_filling_empty_id(self) -> None:
+        existing = TaskRecord(
+            key="00000000-0000-0000-0000-000000000001",
+            type=CRM_GROUP_DISRUPTIONS,
+            earthwork_id="point:99",
+        )
+        merged = {col: None for col in TASK_ID_COLUMNS}
+        merged["earthwork_id"] = "point:99"
+        merged["photo_uuid"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        validate_monitor_owned_task_update(
+            existing, merged, CRM_GROUP_DISRUPTIONS
+        )
+
     def test_validate_monitor_owned_rejects_type_change(self) -> None:
         existing = TaskRecord(
             key="00000000-0000-0000-0000-000000000001",
@@ -136,6 +170,58 @@ class CrmTaskStoreGuardsTests(unittest.TestCase):
             {"earthwork_id": "point:99"},
         )
         validate_monitor_owned_task_update(existing, merged, CRM_GROUP_ORDERS)
+
+    def test_task_form_field_groups_orders_etl_locks_ids(self) -> None:
+        record = TaskRecord(
+            key="00000000-0000-0000-0000-000000000001",
+            type=CRM_GROUP_ORDERS,
+            earthwork_id="point:1",
+        )
+        readonly, link = task_form_field_groups(
+            CRM_GROUP_ORDERS,
+            "Уведомления на земляные работы",
+            {"subgroups": {}},
+            record,
+            monitor_owned=True,
+        )
+        self.assertEqual(link, [])
+        for col in TASK_ID_COLUMNS:
+            self.assertIn(col, readonly)
+        self.assertIn("type", readonly)
+
+    def test_task_form_field_groups_disruptions_keeps_link_editable(self) -> None:
+        record = TaskRecord(
+            key="00000000-0000-0000-0000-000000000001",
+            type=CRM_GROUP_DISRUPTIONS,
+        )
+        readonly, link = task_form_field_groups(
+            CRM_GROUP_DISRUPTIONS,
+            "Разрытия",
+            {"subgroups": {}},
+            record,
+            monitor_owned=True,
+        )
+        self.assertIn("earthwork_id", link)
+        self.assertNotIn("earthwork_id", readonly)
+        self.assertIn("oati_id", link)
+
+
+class CrmTasksNoDeleteTests(unittest.TestCase):
+    def test_plugin_sources_have_no_delete_from_crm_tasks(self) -> None:
+        pattern = re.compile(
+            r"DELETE\s+FROM\s+crm\.tasks\b",
+            re.IGNORECASE,
+        )
+        offenders: list[str] = []
+        for path in _PLUGIN_ROOT.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if pattern.search(text):
+                offenders.append(str(path.relative_to(_REPO_ROOT)))
+        self.assertEqual(
+            offenders,
+            [],
+            f"Found DELETE FROM crm.tasks in: {offenders}",
+        )
 
 
 if __name__ == "__main__":

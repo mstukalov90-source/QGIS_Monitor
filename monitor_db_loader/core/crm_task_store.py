@@ -76,14 +76,17 @@ _audit_columns_ready: Set[str] = set()
 
 
 def is_monitor_owned_task(user_created: Optional[Any]) -> bool:
-    """True when MONITOR ETL created the row (user_created[0] contains 'etl')."""
+    """True when MONITOR ETL owns the row ('etl' in any user_created element)."""
     if not user_created:
         return False
     try:
-        creator = user_created[0]
-    except (IndexError, KeyError, TypeError):
-        return False
-    return ETL_AUDIT_MARKER in str(creator or "").lower()
+        elements = list(user_created)
+    except TypeError:
+        return ETL_AUDIT_MARKER in str(user_created or "").lower()
+    for element in elements:
+        if ETL_AUDIT_MARKER in str(element or "").lower():
+            return True
+    return False
 
 
 def merge_task_id_values(
