@@ -30,6 +30,7 @@ from .crm_task_store import (
 from .crm_tasks import TaskFeature, TaskResult, copy_task_result
 from .crm_tasks_area import collect_tasks_area
 from .crm_ui_constants import (
+    FIELD_DATA_SUBGROUP,
     SNAPSHOT_SOURCES,
     TASK_SOURCE_LABELS,
     TaskSource,
@@ -75,6 +76,11 @@ _SYMBOLOGY = {
             "outline_width": 0.8,
         },
     },
+}
+
+_FIELD_DATA_POINT_SYMBOLOGY = {
+    "geometry_type": "point",
+    "symbology": {"color": "#9900cc", "size": 4, "marker_type": "circle"},
 }
 
 
@@ -136,8 +142,10 @@ def _geometry_type(geom: QgsGeometry) -> Optional[int]:
 
 def _feature_geometry_wgs84(task_feat: TaskFeature) -> Optional[QgsGeometry]:
     if task_feat.area_geom and not task_feat.area_geom.isEmpty():
-        geom = QgsGeometry(task_feat.area_geom)
-        return geom
+        return QgsGeometry(task_feat.area_geom)
+
+    if task_feat.task_geom and not task_feat.task_geom.isEmpty():
+        return QgsGeometry(task_feat.task_geom)
 
     layer = task_feat.layer
     if not layer or not layer.isValid() or task_feat.feature_id is None:
@@ -158,6 +166,17 @@ def _feature_geometry_wgs84(task_feat: TaskFeature) -> Optional[QgsGeometry]:
             QgsCoordinateTransform(source_crs, WGS84_CRS, transform_context())
         )
     return out if not out.isEmpty() else None
+
+
+def _symbology_for_subgroup(
+    subgroup_name: str, gtype: int
+) -> Optional[Dict[str, Any]]:
+    if (
+        subgroup_name == FIELD_DATA_SUBGROUP
+        and gtype == QgsWkbTypes.PointGeometry
+    ):
+        return _FIELD_DATA_POINT_SYMBOLOGY
+    return _SYMBOLOGY.get(gtype)
 
 
 def _business_id(
@@ -295,7 +314,7 @@ def build_subgroup_layers(
         provider.addFeatures(qgs_features)
         layer.updateExtents()
 
-        symbology_def = _SYMBOLOGY.get(gtype)
+        symbology_def = _symbology_for_subgroup(subgroup_name, gtype)
         if symbology_def:
             apply_symbology(layer, symbology_def)
 
